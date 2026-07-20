@@ -1,0 +1,2 @@
+linux_releae_V0_1.zip filter=lfs diff=lfs merge=lfs -text
+windows_release_V0_1.zip filter=lfs diff=lfs merge=lfs -text
