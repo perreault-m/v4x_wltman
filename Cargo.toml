@@ -32,9 +32,14 @@ tokio = { version = "1", features = ["time", "rt-multi-thread", "macros", "proce
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Construction/signature/soumission de transaction -- API haut niveau async,
 # support Ed25519 confirmé (autofill + sign_transaction + submit_and_wait).
-# Version non figée ("*") : crate très récente, laisser Cargo résoudre la
-# dernière version publiée.
-xrpl-mithril = "*"
+# Version figée EXACTEMENT ("=") plutôt qu'un simple caret : c'est la seule
+# dépendance qui manipule la clé privée pour signer -- on ne veut PAS qu'un
+# `cargo update` tire silencieusement une nouvelle version (compromise ou
+# simplement cassée) sans revue explicite. Toute mise à jour doit être un
+# changement volontaire de cette ligne + relecture du diff amont, et
+# `Cargo.lock` doit être committé pour figer aussi toutes les dépendances
+# transitives (xrpl-mithril-{types,codec,models,wallet,client,tx}).
+xrpl-mithril = "=0.5.3"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [profile.release]

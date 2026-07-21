@@ -8,6 +8,13 @@
 use crate::wallet::Wallet;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::time::Duration;
+
+/// Délai maximal accordé à un appel réseau (lecture JSON-RPC, faucet, ou
+/// étape de la construction/soumission d'un paiement) avant d'abandonner
+/// avec une erreur explicite plutôt que de rester bloqué indéfiniment si le
+/// serveur XRPL est lent, injoignable, ou ne répond jamais.
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
@@ -58,6 +65,7 @@ async fn rpc_call(network: Network, method: &str, params: Value) -> Result<Value
     let resp = client
         .post(network.rpc_url())
         .json(&body)
+        .timeout(NETWORK_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("Erreur réseau : {}", e))?;
@@ -187,6 +195,7 @@ pub async fn fund_via_faucet(address: &str, network: Network) -> Result<(), Stri
     let resp = client
         .post(url)
         .json(&json!({ "destination": address }))
+        .timeout(NETWORK_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("Erreur réseau (faucet) : {}", e))?;
@@ -362,21 +371,27 @@ pub async fn send_payment(
     let client = JsonRpcClient::new(network.rpc_url())
         .map_err(|e| format!("Erreur connexion : {:?}", e))?;
 
-    // Gestion spéciale pour les comptes non activés
-    if let Err(e) = autofill(&client, &mut unsigned).await {
-        if e.to_string().contains("Account not found") || e.to_string().contains("actNotFound") {
-            eprintln!("Compte destinataire non activé → tentative d'activation avec Payment");
-            // On continue quand même (le réseau accepte les paiements d'activation)
-        } else {
-            return Err(format!("Erreur préparation : {}", e));
-        }
-    }
+    // `autofill` interroge l'état du compte ÉMETTEUR (Sequence, Fee,
+    // LastLedgerSequence) -- PAS celui du destinataire. Un destinataire non
+    // activé est un cas parfaitement normal pour un Payment (c'est justement
+    // ce qui l'active) et ne fait pas échouer `autofill`. Si `autofill`
+    // échoue, c'est donc que le compte ÉMETTEUR lui-même pose problème (non
+    // activé, réseau injoignable, etc.) -- continuer quand même produirait
+    // une transaction avec des champs incomplets (Sequence/Fee/
+    // LastLedgerSequence), qui risque d'être rejetée silencieusement ou de
+    // rester bloquée indéfiniment dans `submit_and_wait` sans jamais être
+    // validée. On traite donc toute erreur ici comme fatale.
+    tokio::time::timeout(NETWORK_TIMEOUT, autofill(&client, &mut unsigned))
+        .await
+        .map_err(|_| "Délai dépassé lors de la préparation de la transaction (serveur XRPL injoignable ou trop lent).".to_string())?
+        .map_err(|e| format!("Erreur préparation (compte émetteur) : {}", e))?;
 
     let signed = sign_transaction(&unsigned, &sender)
         .map_err(|e| format!("Erreur signature : {:?}", e))?;
 
-    let result = submit_and_wait(&client, &signed)
+    let result = tokio::time::timeout(NETWORK_TIMEOUT, submit_and_wait(&client, &signed))
         .await
+        .map_err(|_| "Délai dépassé lors de la soumission (aucune confirmation reçue du réseau XRPL).".to_string())?
         .map_err(|e| format!("Erreur soumission : {:?}", e))?;
 
     if result.result_code.starts_with("tes") {

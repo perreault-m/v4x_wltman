@@ -10,7 +10,7 @@
 mod wallet;
 
 use iced::widget::{
-    button, center, checkbox, column, container, mouse_area, opaque, pick_list, scrollable,
+    button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, scrollable,
     stack, text, text_input, Column,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Size, Task, Theme};
@@ -138,7 +138,7 @@ impl NetworkChoice {
     }
 }
 
-type GenOutcome = Result<(String, Wallet, PathBuf), String>;
+type GenOutcome = Result<(String, Wallet, PathBuf, bool), String>;
 /// (adresse, clé publique) -- jamais la clé privée.
 type LoadOutcome = Result<(String, String), String>;
 type InfoOutcome = Result<(BalanceInfo, Vec<TxInfo>), String>;
@@ -152,6 +152,9 @@ struct UnlockedWallet {
     name: String,
     address: String,
     path: PathBuf,
+    /// Vrai si le fichier de ce wallet est chiffré (`*.encrypted.json`) --
+    /// détermine si un mot de passe est nécessaire pour l'envoi.
+    encrypted: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -222,6 +225,18 @@ struct MyApp {
     send_error: Option<String>,
     send_success: Option<String>,
     send_result: Arc<Mutex<Option<SendOutcome>>>,
+
+    // --- vérification d'activation du destinataire (avant envoi) ---
+    dest_check_loading: bool,
+    dest_check_error: Option<String>,
+    /// `Some(false)` = le compte destinataire n'existe pas encore sur le
+    /// réseau (jamais activé) -- l'envoi va donc créer/activer ce compte.
+    dest_activated: Option<bool>,
+    dest_check_result: Arc<Mutex<Option<Result<bool, String>>>>,
+    /// L'utilisateur a coché la case reconnaissant qu'il active un nouveau
+    /// compte. Requis avant de pouvoir confirmer l'envoi si `dest_activated
+    /// == Some(false)`.
+    activation_acknowledged: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +276,10 @@ enum Message {
     CancelSendReview,
     SendTransaction,
     TickSend,
+    TickDestCheck,
+    AcknowledgeActivation(bool),
+
+    CopyAddress(String),
 }
 
 impl MyApp {
@@ -373,6 +392,10 @@ impl MyApp {
                     self.send_confirming = false;
                     self.send_error = None;
                     self.send_success = None;
+                    self.dest_check_loading = false;
+                    self.dest_check_error = None;
+                    self.dest_activated = None;
+                    self.activation_acknowledged = false;
                 }
             }
             Message::CloseModal => {
@@ -430,23 +453,25 @@ impl MyApp {
                 let use_v4x = self.use_v4x_address;
 
                 std::thread::spawn(move || {
-                    let wallet_opt = if use_v4x {
+                    let wallet_result: Result<Option<wallet::Wallet>, String> = if use_v4x {
                         wallet::generate_vanity_wallet(&prefixes, Some(attempts), Some(cancel))
                     } else {
-                        Some(wallet::generate_random_wallet())
+                        wallet::generate_random_wallet().map(Some)
                     };
 
-                    let outcome: GenOutcome = match wallet_opt {
-                        None => Err("Recherche annulée.".to_string()),
-                        Some(w) => {
+                    let outcome: GenOutcome = match wallet_result {
+                        Ok(None) => Err("Recherche annulée.".to_string()),
+                        Ok(Some(w)) => {
+                            let is_encrypted = matches!(&password, Some(pw) if !pw.is_empty());
                             let save_result = match &password {
                                 Some(pw) if !pw.is_empty() => {
                                     wallet::encrypt_and_save(&w, &name_for_thread, pw)
                                 }
                                 _ => wallet::save_wallet(&w, &name_for_thread),
                             };
-                            save_result.map(|path| (name_for_thread.clone(), w, path))
+                            save_result.map(|path| (name_for_thread.clone(), w, path, is_encrypted))
                         }
+                        Err(e) => Err(e),
                     };
 
                     *result_slot.lock().unwrap() = Some(outcome);
@@ -465,12 +490,13 @@ impl MyApp {
                     if let Some(outcome) = slot.take() {
                         self.generating = false;
                         match outcome {
-                            Ok((name, w, _path)) => {
+                            Ok((name, w, _path, is_encrypted)) => {
                                 self.unlocked_wallets.retain(|u| u.name != name);
                                 self.unlocked_wallets.push(UnlockedWallet {
                                     name: name.clone(),
                                     address: w.address.clone(),
                                     path: _path,
+                                    encrypted: is_encrypted,
                                 });
                                 self.unlocked_wallets.sort_by(|a, b| a.name.cmp(&b.name));
                                 self.selected_unlocked = Some(name.clone());
@@ -551,6 +577,7 @@ impl MyApp {
                                         name: file.name.clone(),
                                         address,
                                         path: file.path.clone(),
+                                        encrypted: file.encrypted,
                                     });
                                     self.unlocked_wallets.sort_by(|a, b| a.name.cmp(&b.name));
                                     self.selected_unlocked = Some(file.name.clone());
@@ -663,10 +690,17 @@ impl MyApp {
             Message::ReviewSend => {
                 self.send_error = None;
 
-                if self.selected_unlocked.is_none() {
-                    self.send_error = Some("Aucun wallet sélectionné.".into());
-                    return Task::none();
-                }
+                let wallet_encrypted = match self
+                    .selected_unlocked
+                    .as_ref()
+                    .and_then(|name| self.unlocked_wallets.iter().find(|w| &w.name == name))
+                {
+                    Some(w) => w.encrypted,
+                    None => {
+                        self.send_error = Some("Aucun wallet sélectionné.".into());
+                        return Task::none();
+                    }
+                };
                 if !looks_like_xrpl_address(&self.send_destination) {
                     self.send_error =
                         Some("Adresse destinataire invalide (doit commencer par 'r').".into());
@@ -683,20 +717,94 @@ impl MyApp {
                         Some("Destination tag invalide (doit être un nombre entier).".into());
                     return Task::none();
                 }
-                if self.send_password.is_empty() {
+                // Un mot de passe n'est nécessaire que si ce wallet est
+                // effectivement chiffré -- un wallet non chiffré peut être
+                // utilisé pour l'envoi sans mot de passe.
+                if wallet_encrypted && self.send_password.is_empty() {
                     self.send_error = Some("Mot de passe manquant.".into());
                     return Task::none();
                 }
 
                 self.send_confirming = true;
+                self.activation_acknowledged = false;
+                self.dest_activated = None;
+                self.dest_check_error = None;
+                self.dest_check_loading = true;
+                *self.dest_check_result.lock().unwrap() = None;
+
+                // Vérifie si le compte destinataire existe déjà sur le réseau
+                // (n'a besoin que de l'adresse -- aucun mot de passe). Permet
+                // d'avertir l'utilisateur si cet envoi va activer un compte
+                // qui n'existe pas encore.
+                let destination = self.send_destination.trim().to_string();
+                let network = self.network.as_str().to_string();
+                let result_slot = Arc::clone(&self.dest_check_result);
+
+                std::thread::spawn(move || {
+                    let outcome: Result<bool, String> = run_cli(vec![
+                        "balance".to_string(),
+                        "--address".to_string(),
+                        destination,
+                        "--network".to_string(),
+                        network,
+                    ])
+                    .and_then(|s| {
+                        serde_json::from_str::<serde_json::Value>(&s)
+                            .map_err(|_| "Réponse balance invalide.".to_string())
+                    })
+                    .and_then(|v| {
+                        v.get("activated")
+                            .and_then(|a| a.as_bool())
+                            .ok_or_else(|| "Réponse balance incomplète.".to_string())
+                    });
+
+                    *result_slot.lock().unwrap() = Some(outcome);
+                });
+
+                return Self::schedule(Message::TickDestCheck);
             }
             Message::CancelSendReview => {
                 self.send_confirming = false;
+                self.dest_check_loading = false;
+                self.dest_check_error = None;
+                self.dest_activated = None;
+                self.activation_acknowledged = false;
+            }
+            Message::TickDestCheck => {
+                if self.dest_check_loading {
+                    let mut slot = self.dest_check_result.lock().unwrap();
+                    if let Some(outcome) = slot.take() {
+                        self.dest_check_loading = false;
+                        match outcome {
+                            Ok(activated) => self.dest_activated = Some(activated),
+                            Err(e) => self.dest_check_error = Some(e),
+                        }
+                    } else {
+                        drop(slot);
+                        return Self::schedule(Message::TickDestCheck);
+                    }
+                }
+            }
+            Message::AcknowledgeActivation(v) => self.activation_acknowledged = v,
+
+            Message::CopyAddress(address) => {
+                return iced::clipboard::write(address);
             }
 
             Message::SendTransaction => {
                 self.send_error = None;
                 self.send_success = None;
+
+                // Si le destinataire est confirmé comme non activé, l'utilisateur
+                // doit avoir explicitement coché la case d'avertissement avant
+                // qu'on ne signe/soumette quoi que ce soit.
+                if self.dest_activated == Some(false) && !self.activation_acknowledged {
+                    self.send_error = Some(
+                        "Veuillez cocher la case confirmant l'activation du nouveau compte."
+                            .into(),
+                    );
+                    return Task::none();
+                }
 
                 let wallet = match self
                     .selected_unlocked
@@ -706,7 +814,6 @@ impl MyApp {
                     Some(w) => w.clone(),
                     None => {
                         self.send_error = Some("Aucun wallet sélectionné.".into());
-                        self.send_confirming = false;
                         return Task::none();
                     }
                 };
@@ -716,6 +823,7 @@ impl MyApp {
 
                 let result_slot = Arc::clone(&self.send_result);
                 let path_str = wallet.path.to_string_lossy().to_string();
+                let wallet_encrypted = wallet.encrypted;
                 let password = self.send_password.clone();
                 let destination = self.send_destination.clone();
                 let amount = self.send_amount.clone();
@@ -727,7 +835,6 @@ impl MyApp {
                         "send".to_string(),
                         "-f".to_string(),
                         path_str,
-                        "--password-stdin".to_string(),
                         "--to".to_string(),
                         destination,
                         "--amount".to_string(),
@@ -740,8 +847,18 @@ impl MyApp {
                         args.push(destination_tag);
                     }
 
-                    let outcome: SendOutcome = run_cli_with_stdin(args, Some(&password))
-                        .and_then(|s| {
+                    // Un wallet non chiffré n'a pas besoin de mot de passe --
+                    // on n'envoie `--password-stdin` (et la donnée sur stdin)
+                    // que si ce wallet est effectivement chiffré.
+                    let stdin_payload = if wallet_encrypted {
+                        args.push("--password-stdin".to_string());
+                        Some(password)
+                    } else {
+                        None
+                    };
+
+                    let outcome: SendOutcome =
+                        run_cli_with_stdin(args, stdin_payload.as_deref()).and_then(|s| {
                             let v: serde_json::Value = serde_json::from_str(&s)
                                 .map_err(|_| "Réponse CLI invalide.".to_string())?;
                             v.get("hash")
@@ -754,7 +871,6 @@ impl MyApp {
                 });
 
                 self.send_password.clear();
-                self.send_confirming = false;
 
                 return Self::schedule(Message::TickSend)
             }
@@ -929,7 +1045,7 @@ impl MyApp {
                 .into();
         };
 
-        let mut items: Vec<Element<Message>> = vec![info_row("Adresse", &w.address)];
+        let mut items: Vec<Element<Message>> = vec![address_row(&w.address)];
 
         if self.info_loading {
             items.push(text("Chargement...").size(13).color(MUTED).into());
@@ -1129,6 +1245,13 @@ impl MyApp {
             .clone()
             .unwrap_or_else(|| "Aucun wallet sélectionné".to_string());
 
+        let wallet_encrypted = self
+            .selected_unlocked
+            .as_ref()
+            .and_then(|name| self.unlocked_wallets.iter().find(|w| &w.name == name))
+            .map(|w| w.encrypted)
+            .unwrap_or(false);
+
         let mut items: Vec<Element<Message>> = vec![
             text("Envoyer des XRP").size(22).color(ACCENT).into(),
             text(format!("Depuis : {} ({})", wallet_label, self.network.as_str()))
@@ -1147,12 +1270,26 @@ impl MyApp {
                 .on_input(Message::SendDestinationTagChanged)
                 .padding(10)
                 .into(),
-            text_input("Mot de passe du wallet", &self.send_password)
-                .on_input(Message::SendPasswordChanged)
-                .secure(true)
-                .padding(10)
-                .into(),
         ];
+
+        // Un wallet non chiffré n'a pas de mot de passe -- inutile (et
+        // trompeur) de demander à l'utilisateur d'en saisir un.
+        if wallet_encrypted {
+            items.push(
+                text_input("Mot de passe du wallet", &self.send_password)
+                    .on_input(Message::SendPasswordChanged)
+                    .secure(true)
+                    .padding(10)
+                    .into(),
+            );
+        } else if self.selected_unlocked.is_some() {
+            items.push(
+                text("Ce wallet n'est pas chiffré : aucun mot de passe requis.")
+                    .size(12)
+                    .color(MUTED)
+                    .into(),
+            );
+        }
 
         if self.network == NetworkChoice::Mainnet {
             items.push(
@@ -1230,6 +1367,58 @@ impl MyApp {
             );
         }
 
+        // --- Statut d'activation du compte destinataire ---
+        if self.dest_check_loading {
+            items.push(
+                text("Vérification du compte destinataire...")
+                    .size(13)
+                    .color(MUTED)
+                    .into(),
+            );
+        } else if let Some(err) = &self.dest_check_error {
+            items.push(
+                text(format!(
+                    "⚠ Impossible de vérifier ce compte ({}). Vérifiez l'adresse avec soin avant de continuer.",
+                    err
+                ))
+                .size(12)
+                .color(WARNING)
+                .into(),
+            );
+        } else if self.dest_activated == Some(false) {
+            items.push(
+                container(
+                    column![
+                        text("⚠ Compte destinataire non activé").size(14).color(WARNING),
+                        text(
+                            "Cette adresse n'existe pas encore sur le réseau. Cet envoi va \
+                             l'ACTIVER en tant que nouveau compte -- assurez-vous que l'adresse \
+                             est correcte : un envoi vers une mauvaise adresse est irréversible."
+                        )
+                        .size(12)
+                        .color(MUTED),
+                        checkbox(
+                            "Je comprends et je souhaite activer ce nouveau compte.",
+                            self.activation_acknowledged,
+                        )
+                        .on_toggle(Message::AcknowledgeActivation),
+                    ]
+                    .spacing(8),
+                )
+                .padding(12)
+                .style(|_theme| container::Style {
+                    background: Some(Background::Color(Color { a: 0.08, ..WARNING })),
+                    border: Border {
+                        color: WARNING,
+                        width: 1.0,
+                        radius: 8.0.into(),
+                    },
+                    ..container::Style::default()
+                })
+                .into(),
+            );
+        }
+
         if self.sending {
             items.push(text("Envoi en cours...").size(14).color(MUTED).into());
         }
@@ -1240,6 +1429,9 @@ impl MyApp {
             items.push(text(msg).color(SUCCESS).into());
         }
 
+        let needs_ack = self.dest_activated == Some(false) && !self.activation_acknowledged;
+        let can_send = !self.sending && !self.dest_check_loading && !needs_ack;
+
         items.push(
             button(text("Confirmer l'envoi").size(15))
                 .padding(12)
@@ -1249,7 +1441,7 @@ impl MyApp {
                 } else {
                     primary_button
                 })
-                .on_press_maybe((!self.sending).then_some(Message::SendTransaction))
+                .on_press_maybe(can_send.then_some(Message::SendTransaction))
                 .into(),
         );
         items.push(
@@ -1282,6 +1474,28 @@ fn info_row<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
         scrollable(text(value).size(14).color(ACCENT)).width(Length::Fill),
     ]
     .spacing(4)
+    .into()
+}
+
+/// Comme `info_row`, mais pour l'adresse du wallet actif : ajoute un bouton
+/// pour copier l'adresse dans le presse-papiers.
+fn address_row(address: &str) -> Element<'static, Message> {
+    let address_owned = address.to_string();
+
+    row![
+        column![
+            text("ADRESSE").size(11).color(MUTED),
+            scrollable(text(address_owned.clone()).size(14).color(ACCENT)).width(Length::Fill),
+        ]
+        .spacing(4)
+        .width(Length::Fill),
+        button(text("📋 Copier").size(12))
+            .padding([8, 12])
+            .style(secondary_button)
+            .on_press(Message::CopyAddress(address_owned)),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
     .into()
 }
 

@@ -132,17 +132,21 @@ fn handle_generate(args: &[String]) {
 
     eprintln!("Generating XRPL wallet...");
 
-    let generated_wallet = if !prefixes.is_empty() {
+    let generated_wallet: Result<Option<wallet::Wallet>, String> = if !prefixes.is_empty() {
         eprintln!("Searching for vanity address with prefixes: {:?}", prefixes);
         generate_vanity_with_progress(&prefixes)
     } else {
-        Some(wallet::generate_random_wallet())
+        wallet::generate_random_wallet().map(Some)
     };
 
     let w = match generated_wallet {
-        Some(w) => w,
-        None => {
+        Ok(Some(w)) => w,
+        Ok(None) => {
             eprintln!("Génération annulée.");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Erreur lors de la génération : {}", e);
             std::process::exit(1);
         }
     };
@@ -166,7 +170,7 @@ fn handle_generate(args: &[String]) {
     println!("{}", serde_json::to_string_pretty(&w).unwrap());
 }
 
-fn generate_vanity_with_progress(prefixes: &[String]) -> Option<wallet::Wallet> {
+fn generate_vanity_with_progress(prefixes: &[String]) -> Result<Option<wallet::Wallet>, String> {
     let attempts = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
 
@@ -342,13 +346,7 @@ async fn handle_send(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let password = match resolve_password(args) {
-        Some(p) => p,
-        None => {
-            eprintln!("Erreur : mot de passe manquant (-p/--password ou --password-stdin)");
-            std::process::exit(1);
-        }
-    };
+    let password = resolve_password(args);
     let destination = match get_flag_value(args, "--to") {
         Some(d) => d,
         None => {
@@ -378,15 +376,37 @@ async fn handle_send(args: &[String]) {
     };
     let network = parse_network(args);
 
-    eprintln!("Déchiffrement du wallet...");
+    eprintln!("Chargement du wallet...");
 
     // Le wallet déchiffré (avec sa clé privée) ne vit que dans cette fonction,
     // le temps de signer et soumettre -- puis ce processus se termine.
-    let decrypted = match wallet::decrypt_wallet(&file, &password) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("Erreur : {}", e);
-            std::process::exit(1);
+    // Un mot de passe n'est nécessaire (et utilisé) que si le fichier est
+    // effectivement chiffré (`*.encrypted.json`) -- un wallet sauvegardé en
+    // clair (`*.json`) peut être envoyé sans mot de passe.
+    let decrypted = if wallet::is_encrypted_file(&file) {
+        let pw = match password {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                eprintln!(
+                    "Erreur : ce wallet est chiffré, mot de passe manquant (-p/--password ou --password-stdin)"
+                );
+                std::process::exit(1);
+            }
+        };
+        match wallet::decrypt_wallet(&file, &pw) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("Erreur : {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match wallet::load_plain_wallet(&file) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("Erreur : {}", e);
+                std::process::exit(1);
+            }
         }
     };
 
@@ -430,6 +450,7 @@ FAUCET (testnet uniquement -- obtenir des XRP de test gratuits) :
 ENVOI (déchiffre le wallet le temps de cet appel uniquement) :
   cli send -f <FICHIER> --password-stdin --to <DESTINATAIRE> --amount <XRP> [--destination-tag <N>] [--network testnet|mainnet]
   (ou -p <MOT_DE_PASSE> à la place de --password-stdin, pour un usage manuel)
+  (le mot de passe n'est requis que si le fichier est chiffré, i.e. *.encrypted.json)
 
 DÉCHIFFREMENT :
   cli --address -f <FICHIER> [--password-stdin | -p <MOT_DE_PASSE>]   Affiche uniquement l'adresse/clé publique

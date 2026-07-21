@@ -3,91 +3,111 @@ use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Key, Nonce,
 };
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use ripemd::Ripemd160;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256, Sha512};
+use sha2::Sha256;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use xrpl_mithril::wallet::Wallet as MithrilWallet;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Wallet {
     pub address: String,
+    /// Champs informatifs, non utilisés pour signer (voir plus bas) --
+    /// laissés vides : voir la note dans `wallet_from_seed`.
     pub public_key: String,
     pub private_key: String,
-    /// Seed XRPL standard (format "sEd...", Base58Check). 
+    /// Seed XRPL standard (Base58Check). C'est la SEULE donnée nécessaire
+    /// (et utilisée) pour signer -- voir `network.rs::send_payment`, qui
+    /// reconstruit toujours le wallet de signature à partir de ce champ via
+    /// `xrpl_mithril::wallet::Wallet::from_seed_encoded`.
     #[serde(default)]
     pub seed: Option<String>,
 }
 
-/// Version byte XRPL pour les seeds (0x21) → tous les seeds commencent par "s"
-const SEED_VERSION: u8 = 0x21;
+/// Version byte XRPL pour un seed "famille" secp256k1 (un seul octet) --
+/// c'est le format "s..." classique.
+///
+/// NOTE IMPORTANTE : cette application utilisait auparavant l'algorithme
+/// Ed25519 (seeds "sEd..."), qui utilise un préfixe de version à 3 octets.
+/// Cette structure a été vérifiée correcte (comparée octet à octet à deux
+/// seeds Ed25519 réels et valides trouvés indépendamment), mais
+/// `xrpl_mithril::wallet::Wallet::from_seed_encoded` a rejeté un seed
+/// pourtant correctement structuré avec l'erreur "invalid version byte for
+/// seed" -- ce qui indique un bug dans le décodage des seeds Ed25519 de
+/// cette bibliothèque (son propre exemple de seed Ed25519 dans sa
+/// documentation a d'ailleurs un checksum invalide, signe qu'il n'a
+/// probablement jamais été généré/testé pour de vrai). On utilise donc ici
+/// secp256k1 -- le SEUL chemin vérifié fonctionner de bout en bout avec
+/// `xrpl_mithril` (génération ET `from_seed_encoded`), via son propre
+/// exemple de documentation.
+const SECP256K1_SEED_VERSION: u8 = 0x21;
 
-/// Encode 16 octets d'entropie en seed XRPL standard ("sEd..." pour Ed25519).
+/// Encode 16 octets d'entropie en seed XRPL secp256k1 standard ("s...").
+/// `bs58::with_check_version` supporte nativement un octet de version unique
+/// (contrairement au cas Ed25519 à 3 octets), donc pas de construction
+/// manuelle du checksum nécessaire ici.
 fn encode_seed(entropy: &[u8; 16]) -> String {
     bs58::encode(entropy)
         .with_alphabet(bs58::Alphabet::RIPPLE)
-        .with_check_version(SEED_VERSION)
+        .with_check_version(SECP256K1_SEED_VERSION)
         .into_string()
 }
 
-/// Dérive la clé privée ed25519 selon le standard XRPL utilisé par xrpl_mithril :
-/// SHA-512(0xED || entropy) → premiers 32 octets.
-fn derive_ed25519_key_from_entropy(entropy: &[u8; 16]) -> SigningKey {
-    let mut hasher = Sha512::new();
-    hasher.update([0xEDu8]);
-    hasher.update(entropy);
-    let hash = hasher.finalize();
+/// Construit notre `Wallet` (stockage/chiffrement/affichage) à partir d'un
+/// seed en le faisant passer par `xrpl_mithril::wallet::Wallet::from_seed_encoded`
+/// -- exactement le même appel que celui utilisé plus tard pour signer dans
+/// `network.rs::send_payment`. Comme c'est littéralement le même code qui
+/// dérive l'adresse ici et qui signera plus tard, l'adresse affichée est
+/// garantie par construction être celle qui signe réellement.
+///
+/// `public_key`/`private_key` sont laissés vides : la dérivation de clé est
+/// désormais entièrement déléguée à `xrpl_mithril`, qui n'expose pas (à
+/// notre connaissance actuelle de son API) d'accesseur pour récupérer ces
+/// octets bruts. Ils ne sont de toute façon jamais utilisés pour signer --
+/// uniquement `seed` l'est.
+fn wallet_from_seed(seed: &str) -> Result<Wallet, String> {
+    let mw = MithrilWallet::from_seed_encoded(seed)
+        .map_err(|e| format!("Erreur de reconstruction du wallet (xrpl_mithril) : {:?}", e))?;
 
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&hash[..32]);
-    SigningKey::from_bytes(&key_bytes)
+    Ok(Wallet {
+        address: mw.account_id().to_classic_address(),
+        public_key: String::new(),
+        private_key: String::new(),
+        seed: Some(seed.to_string()),
+    })
 }
 
-/// Génère un wallet XRPL aléatoire.
-fn build_wallet_from_new_entropy() -> Wallet {
+/// Génère un wallet XRPL aléatoire (secp256k1). L'entropie est générée
+/// localement (CSPRNG), encodée en seed standard, puis immédiatement
+/// validée/reconstruite via `xrpl_mithril` -- qui fait toute la dérivation
+/// cryptographique réelle (clé, adresse).
+pub fn generate_random_wallet() -> Result<Wallet, String> {
     let mut entropy = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut entropy);
-
-    let signing_key = derive_ed25519_key_from_entropy(&entropy);
-    let vk = signing_key.verifying_key();
-
-    Wallet {
-        address: derive_xrpl_address(&vk),
-        public_key: hex::encode_upper(vk.as_bytes()),
-        private_key: ed25519_private_key_hex(&signing_key),
-        seed: Some(encode_seed(&entropy)),
-    }
+    wallet_from_seed(&encode_seed(&entropy))
 }
 
-fn ed25519_private_key_hex(signing_key: &SigningKey) -> String {
-    let mut bytes = vec![0xEDu8];
-    bytes.extend_from_slice(signing_key.as_bytes());
-    hex::encode_upper(bytes)
-}
-
-pub fn generate_random_wallet() -> Wallet {
-    build_wallet_from_new_entropy()
-}
-
-/// Recherche un wallet vanity.
+/// Recherche un wallet vanity (secp256k1) via `xrpl_mithril`.
+///
+/// Retourne `Ok(None)` si la recherche a été annulée, `Err(_)` en cas
+/// d'erreur de reconstruction, `Ok(Some(wallet))` en cas de succès.
 pub fn generate_vanity_wallet(
     prefixes: &[String],
     attempts_counter: Option<Arc<AtomicU64>>,
     cancel: Option<Arc<AtomicBool>>,
-) -> Option<Wallet> {
+) -> Result<Option<Wallet>, String> {
     let mut attempts: u64 = 0;
 
     loop {
         if let Some(c) = &cancel {
             if c.load(Ordering::Relaxed) {
-                return None;
+                return Ok(None);
             }
         }
 
@@ -98,42 +118,23 @@ pub fn generate_vanity_wallet(
 
         let mut entropy = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut entropy);
-        let signing_key = derive_ed25519_key_from_entropy(&entropy);
-        let vk = signing_key.verifying_key();
-        let address = derive_xrpl_address(&vk);
-        let address_upper = address.to_uppercase();
+        let seed = encode_seed(&entropy);
+
+        let mw = match MithrilWallet::from_seed_encoded(&seed) {
+            Ok(w) => w,
+            // Ne devrait quasiment jamais arriver pour un seed qu'on vient
+            // de générer nous-mêmes correctement formé -- on retente plutôt
+            // que d'interrompre toute la recherche pour un cas limite.
+            Err(_) => continue,
+        };
+        let address_upper = mw.account_id().to_classic_address().to_uppercase();
 
         if prefixes.iter().any(|p| address_upper.starts_with(p.as_str())) {
-            return Some(Wallet {
-                address,
-                public_key: hex::encode_upper(vk.as_bytes()),
-                private_key: ed25519_private_key_hex(&signing_key),
-                seed: Some(encode_seed(&entropy)),
-            });
+            return wallet_from_seed(&seed).map(Some);
         }
     }
 }
 
-pub fn derive_xrpl_address(verifying_key: &VerifyingKey) -> String {
-    let mut pubkey = vec![0xED];
-    pubkey.extend_from_slice(verifying_key.as_bytes());
-
-    let mut sha = Sha256::new();
-    sha.update(&pubkey);
-    let hash = sha.finalize();
-
-    let mut rmd = Ripemd160::new();
-    rmd.update(hash);
-    let account_id = rmd.finalize();
-
-    let mut payload = vec![0x00];
-    payload.extend_from_slice(&account_id);
-
-    bs58::encode(payload)
-        .with_alphabet(bs58::Alphabet::RIPPLE)
-        .with_check()
-        .into_string()
-}
 
 // ==================== Le reste du fichier reste inchangé ====================
 
@@ -146,6 +147,13 @@ fn exe_dir() -> PathBuf {
 
 const PLAIN_SUFFIX: &str = ".json";
 const ENCRYPTED_SUFFIX: &str = ".encrypted.json";
+
+/// Indique, d'après son nom de fichier, si un wallet est stocké chiffré
+/// (`*.encrypted.json`) ou en clair (`*.json`). Permet à l'appelant de savoir
+/// si un mot de passe est nécessaire avant de tenter de le charger.
+pub fn is_encrypted_file(path: &str) -> bool {
+    path.ends_with(ENCRYPTED_SUFFIX)
+}
 
 pub fn wallets_dir() -> PathBuf {
     let dir = exe_dir().join("wallets");
