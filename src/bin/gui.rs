@@ -11,7 +11,7 @@ mod wallet;
 
 use iced::widget::{
     button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, scrollable,
-    stack, text, text_input, Column,
+    stack, text, text_input, toggler, Column,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Size, Task, Theme};
 use serde::Deserialize;
@@ -31,6 +31,10 @@ const WARNING_HOVER: Color = Color::from_rgb(1.0, 0.75, 0.25);
 const SUCCESS: Color = Color::from_rgb(0.25, 0.95, 0.45);
 const ERROR: Color = Color::from_rgb(1.0, 0.35, 0.35);
 const MUTED: Color = Color::from_rgb(0.55, 0.68, 0.6);
+/// Orange brûlé utilisé pour les titres de panneaux ("PORTEFEUILLE",
+/// "ACTIONS", "SOLDE & TRANSACTIONS"), pour les distinguer du vert d'accent
+/// utilisé ailleurs (adresses, états actifs, etc).
+const TITLE_COLOR: Color = Color::from_rgb(0.80, 0.40, 0.12);
 const PAGE_BG: Color = Color::from_rgb(0.02, 0.03, 0.025);
 const PANEL_BG: Color = Color::from_rgb(0.05, 0.08, 0.06);
 const PANEL_BORDER: Color = Color::from_rgba(0.0, 0.95, 0.35, 0.25);
@@ -915,112 +919,33 @@ impl MyApp {
     }
 
     fn main_view(&self) -> Element<Message> {
-        let header = column![
-            text("V4X").size(40).color(ACCENT),
-            text("WALLET MANAGER").size(14).color(MUTED),
-        ]
-        .spacing(2)
-        .align_x(Alignment::Center);
-
-        let network_card = card(
-            "RÉSEAU",
+        let header = row![
             column![
-                network_button(
-                    "TESTNET",
-                    self.network == NetworkChoice::Testnet,
-                    Message::NetworkChanged(NetworkChoice::Testnet),
-                    false,
-                ),
-                network_button(
-                    "MAINNET (argent réel)",
-                    self.network == NetworkChoice::Mainnet,
-                    Message::NetworkChanged(NetworkChoice::Mainnet),
-                    true,
-                ),
+                text("V4X").size(32).color(ACCENT),
+                text("WALLET MANAGER").size(12).color(MUTED),
             ]
-            .spacing(10)
-            .into(),
-        );
+            .spacing(0),
+            iced::widget::horizontal_space(),
+            self.network_toggle(),
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
 
-        let actions_card = card(
-            "PORTEFEUILLE",
-            Column::with_children(vec![
-                button(text("➕  Créer un Wallet V4X").size(16))
-                    .padding(14)
-                    .width(Length::Fill)
-                    .style(primary_button)
-                    .on_press(Message::OpenCreateModal)
-                    .into(),
-                button(text("📂  Charger un Wallet V4X").size(16))
-                    .padding(14)
-                    .width(Length::Fill)
-                    .style(secondary_button)
-                    .on_press(Message::OpenLoadModal)
-                    .into(),
-            ])
-            .spacing(12)
-            .into(),
-        );
+        let wallet_panel = card("PORTEFEUILLE", self.wallet_top_panel(), Length::Fill);
 
-        let names: Vec<String> = self.unlocked_wallets.iter().map(|w| w.name.clone()).collect();
-        let has_selection = self.selected_unlocked.is_some();
+        let actions_card = card("ACTIONS", self.actions_panel(), Length::Fixed(280.0));
+        let info_card = card("SOLDE & TRANSACTIONS", self.info_panel(), Length::Fill);
 
-        let mut selector_items: Vec<Element<Message>> = vec![
-            pick_list(names, self.selected_unlocked.clone(), Message::SelectWallet)
-                .placeholder("Aucun wallet V4X déverrouillé")
-                .width(Length::Fill)
-                .into(),
-            button(text("💸  Envoyer").size(15))
-                .padding(12)
-                .width(Length::Fill)
-                .style(primary_button)
-                .on_press_maybe(has_selection.then_some(Message::OpenSendModal))
-                .into(),
-            button(text("🔄  Rafraîchir").size(15))
-                .padding(12)
-                .width(Length::Fill)
-                .style(secondary_button)
-                .on_press_maybe(has_selection.then_some(Message::RefreshInfo))
-                .into(),
-        ];
+        let lower = row![actions_card, info_card]
+            .spacing(20)
+            .align_y(Alignment::Start)
+            .width(Length::Fill);
 
-        // Le faucet n'existe que sur testnet -- invisible sur mainnet.
-        if self.network == NetworkChoice::Testnet {
-            selector_items.push(
-                button(text(if self.faucet_requesting {
-                    "Faucet en cours..."
-                } else {
-                    "🚿  Obtenir des XRP de test (faucet)"
-                }).size(15))
-                .padding(12)
-                .width(Length::Fill)
-                .style(secondary_button)
-                .on_press_maybe(
-                    (has_selection && !self.faucet_requesting).then_some(Message::RequestFaucet),
-                )
-                .into(),
-            );
-
-            if let Some(msg) = &self.faucet_message {
-                selector_items.push(text(msg).size(12).color(SUCCESS).into());
-            }
-            if let Some(err) = &self.faucet_error {
-                selector_items.push(text(err).size(12).color(ERROR).into());
-            }
-        }
-
-        let selector_card = card(
-            "WALLET ACTIF",
-            Column::with_children(selector_items).spacing(12).into(),
-        );
-
-        let info_card = card("SOLDE & TRANSACTIONS", self.info_panel());
-
-        let content = column![header, network_card, actions_card, selector_card, info_card]
+        let content = column![header, wallet_panel, lower]
             .spacing(20)
             .padding(30)
-            .align_x(Alignment::Center)
-            .max_width(600);
+            .width(Length::Fill)
+            .max_width(1000);
 
         container(scrollable(content))
             .width(Length::Fill)
@@ -1033,19 +958,144 @@ impl MyApp {
             .into()
     }
 
+    /// Switch testnet/mainnet, avec un libellé de chaque côté qui s'éclaire
+    /// pour indiquer clairement l'état actif (orange = mainnet = argent réel).
+    fn network_toggle(&self) -> Element<Message> {
+        let is_mainnet = self.network == NetworkChoice::Mainnet;
+
+        row![
+            text("Testnet")
+                .size(13)
+                .color(if is_mainnet { MUTED } else { ACCENT }),
+            toggler(is_mainnet)
+                .on_toggle(|v| Message::NetworkChanged(if v {
+                    NetworkChoice::Mainnet
+                } else {
+                    NetworkChoice::Testnet
+                }))
+                .size(22),
+            text("Mainnet")
+                .size(13)
+                .color(if is_mainnet { WARNING } else { MUTED }),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    /// Panneau du haut : sélection/gestion du wallet actif (choisir, créer,
+    /// charger) + adresse et bouton de copie du wallet actuellement
+    /// sélectionné, le tout sur une largeur pleine et compacte plutôt
+    /// qu'étalé verticalement.
+    fn wallet_top_panel(&self) -> Element<Message> {
+        let names: Vec<String> = self.unlocked_wallets.iter().map(|w| w.name.clone()).collect();
+
+        let controls = row![
+            pick_list(names, self.selected_unlocked.clone(), Message::SelectWallet)
+                .placeholder("Aucun wallet V4X déverrouillé")
+                .width(Length::Fill),
+            button(text("Créer").size(14))
+                .padding([10, 14])
+                .style(primary_button)
+                .on_press(Message::OpenCreateModal),
+            button(text("Charger").size(14))
+                .padding([10, 14])
+                .style(secondary_button)
+                .on_press(Message::OpenLoadModal),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        let selected = self
+            .selected_unlocked
+            .as_ref()
+            .and_then(|name| self.unlocked_wallets.iter().find(|w| &w.name == name));
+
+        let address_line: Element<Message> = match selected {
+            Some(w) => column![
+                row![
+                    text("ADRESSE").size(11).color(MUTED),
+                    button(text("Copier").size(12))
+                        .padding([4, 10])
+                        .style(secondary_button)
+                        .on_press(Message::CopyAddress(w.address.clone())),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                scrollable(text(w.address.clone()).size(14).color(ACCENT)).width(Length::Fill),
+            ]
+            .spacing(4)
+            .into(),
+            None => text("Choisissez, créez ou chargez un wallet pour commencer.")
+                .size(12)
+                .color(MUTED)
+                .into(),
+        };
+
+        column![controls, address_line].spacing(14).into()
+    }
+
+    /// Actions sur le wallet actif : envoyer, rafraîchir, faucet (testnet).
+    fn actions_panel(&self) -> Element<Message> {
+        let has_selection = self.selected_unlocked.is_some();
+
+        let mut items: Vec<Element<Message>> = vec![
+            button(text("Envoyer").size(15))
+                .padding(12)
+                .width(Length::Fill)
+                .style(primary_button)
+                .on_press_maybe(has_selection.then_some(Message::OpenSendModal))
+                .into(),
+            button(text("Rafraîchir").size(15))
+                .padding(12)
+                .width(Length::Fill)
+                .style(secondary_button)
+                .on_press_maybe(has_selection.then_some(Message::RefreshInfo))
+                .into(),
+        ];
+
+        // Le faucet n'existe que sur testnet -- invisible sur mainnet.
+        if self.network == NetworkChoice::Testnet {
+            items.push(
+                button(
+                    text(if self.faucet_requesting {
+                        "Faucet en cours..."
+                    } else {
+                        "XRP de test (faucet)"
+                    })
+                    .size(15),
+                )
+                .padding(12)
+                .width(Length::Fill)
+                .style(secondary_button)
+                .on_press_maybe(
+                    (has_selection && !self.faucet_requesting).then_some(Message::RequestFaucet),
+                )
+                .into(),
+            );
+
+            if let Some(msg) = &self.faucet_message {
+                items.push(text(msg).size(12).color(SUCCESS).into());
+            }
+            if let Some(err) = &self.faucet_error {
+                items.push(text(err).size(12).color(ERROR).into());
+            }
+        }
+
+        Column::with_children(items).spacing(12).into()
+    }
+
     fn info_panel(&self) -> Element<Message> {
         let selected = self
             .selected_unlocked
             .as_ref()
             .and_then(|name| self.unlocked_wallets.iter().find(|w| &w.name == name));
 
-        let Some(w) = selected else {
-            return text("Sélectionnez un wallet V4X déverrouillé pour voir ses informations.")
-                .color(MUTED)
-                .into();
+        let Some(_w) = selected else {
+            return text("Aucun wallet sélectionné.").size(13).color(MUTED).into();
         };
 
-        let mut items: Vec<Element<Message>> = vec![address_row(&w.address)];
+        let mut items: Vec<Element<Message>> = Vec::new();
 
         if self.info_loading {
             items.push(text("Chargement...").size(13).color(MUTED).into());
@@ -1293,7 +1343,7 @@ impl MyApp {
 
         if self.network == NetworkChoice::Mainnet {
             items.push(
-                text("⚠ MAINNET -- cette transaction utilisera du XRP réel.")
+                text("MAINNET -- cette transaction utilisera du XRP réel.")
                     .size(13)
                     .color(WARNING)
                     .into(),
@@ -1360,7 +1410,7 @@ impl MyApp {
 
         if self.network == NetworkChoice::Mainnet {
             items.push(
-                text("⚠ MAINNET -- cette transaction utilisera du XRP réel et est irréversible.")
+                text("MAINNET -- cette transaction utilisera du XRP réel et est irréversible.")
                     .size(13)
                     .color(WARNING)
                     .into(),
@@ -1378,7 +1428,7 @@ impl MyApp {
         } else if let Some(err) = &self.dest_check_error {
             items.push(
                 text(format!(
-                    "⚠ Impossible de vérifier ce compte ({}). Vérifiez l'adresse avec soin avant de continuer.",
+                    "Impossible de vérifier ce compte ({}). Vérifiez l'adresse avec soin avant de continuer.",
                     err
                 ))
                 .size(12)
@@ -1389,7 +1439,7 @@ impl MyApp {
             items.push(
                 container(
                     column![
-                        text("⚠ Compte destinataire non activé").size(14).color(WARNING),
+                        text("Compte destinataire non activé").size(14).color(WARNING),
                         text(
                             "Cette adresse n'existe pas encore sur le réseau. Cet envoi va \
                              l'ACTIVER en tant que nouveau compte -- assurez-vous que l'adresse \
@@ -1477,28 +1527,6 @@ fn info_row<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
     .into()
 }
 
-/// Comme `info_row`, mais pour l'adresse du wallet actif : ajoute un bouton
-/// pour copier l'adresse dans le presse-papiers.
-fn address_row(address: &str) -> Element<'static, Message> {
-    let address_owned = address.to_string();
-
-    row![
-        column![
-            text("ADRESSE").size(11).color(MUTED),
-            scrollable(text(address_owned.clone()).size(14).color(ACCENT)).width(Length::Fill),
-        ]
-        .spacing(4)
-        .width(Length::Fill),
-        button(text("📋 Copier").size(12))
-            .padding([8, 12])
-            .style(secondary_button)
-            .on_press(Message::CopyAddress(address_owned)),
-    ]
-    .spacing(10)
-    .align_y(Alignment::Center)
-    .into()
-}
-
 /// Variante de `info_row` pour une valeur calculée localement (ex: `format!(...)`)
 /// -- prend une `String` possédée plutôt qu'une référence, pour éviter tout
 /// problème de durée de vie avec une valeur temporaire.
@@ -1536,7 +1564,6 @@ fn looks_like_xrp_amount(amount: &str) -> bool {
 }
 
 fn tx_row(tx: &TxInfo) -> Element<'static, Message> {
-    let status = if tx.successful { "✅" } else { "❌" };
     let amount = tx.amount_xrp.clone().unwrap_or_else(|| "-".to_string());
     let date = tx.date.clone().unwrap_or_else(|| "-".to_string());
     let hash_short = if tx.hash.len() > 14 {
@@ -1551,8 +1578,8 @@ fn tx_row(tx: &TxInfo) -> Element<'static, Message> {
 
     column![
         text(format!(
-            "{} {} — {} XRP{}",
-            status, tx.tx_type, amount, tag_suffix
+            "{} — {} XRP{}",
+            tx.tx_type, amount, tag_suffix
         ))
         .size(13),
         text(format!("{}    {}", date, hash_short)).size(11).color(MUTED),
@@ -1575,10 +1602,10 @@ fn card_style(_theme: &Theme) -> container::Style {
     }
 }
 
-fn card<'a>(title: &'a str, content: Element<'a, Message>) -> Element<'a, Message> {
-    container(column![text(title).size(13).color(ACCENT), content].spacing(16))
+fn card<'a>(title: &'a str, content: Element<'a, Message>, width: Length) -> Element<'a, Message> {
+    container(column![text(title).size(13).color(TITLE_COLOR), content].spacing(16))
         .padding(20)
-        .width(Length::Fixed(560.0))
+        .width(width)
         .style(card_style)
         .into()
 }
@@ -1646,55 +1673,6 @@ fn secondary_button(_theme: &Theme, status: button::Status) -> button::Style {
         },
         ..button::Style::default()
     }
-}
-
-/// Bouton de sélection réseau : plein (accent ou orange) si actif, contour sinon.
-fn network_button(
-    label: &'static str,
-    active: bool,
-    msg: Message,
-    warning: bool,
-) -> Element<'static, Message> {
-    let style = move |_theme: &Theme, status: button::Status| {
-        let base = if warning { WARNING } else { ACCENT };
-        if active {
-            button::Style {
-                background: Some(Background::Color(base)),
-                text_color: Color::BLACK,
-                border: Border {
-                    radius: 6.0.into(),
-                    width: 0.0,
-                    color: Color::TRANSPARENT,
-                },
-                ..button::Style::default()
-            }
-        } else {
-            let fill_alpha = match status {
-                button::Status::Hovered => 0.1,
-                _ => 0.0,
-            };
-            button::Style {
-                background: Some(Background::Color(Color {
-                    a: fill_alpha,
-                    ..base
-                })),
-                text_color: MUTED,
-                border: Border {
-                    radius: 6.0.into(),
-                    width: 1.0,
-                    color: MUTED,
-                },
-                ..button::Style::default()
-            }
-        }
-    };
-
-    button(text(label).size(13))
-        .padding(10)
-        .width(Length::Fill)
-        .style(style)
-        .on_press(msg)
-        .into()
 }
 
 /// Superpose `content` par-dessus `base` avec un fond quasi opaque
