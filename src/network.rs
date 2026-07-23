@@ -32,12 +32,23 @@ impl Network {
         }
     }
 
-    fn rpc_url(&self) -> &'static str {
+    /// Liste ordonnée de serveurs RPC publics à essayer pour ce réseau.
+    /// Sur mainnet, plusieurs clusters publics officiels existent -- si le
+    /// premier est "amendment blocked" (en retard sur des amendements déjà
+    /// activés par le réseau, donc incapable de traiter AUCUNE transaction,
+    /// quelle que soit sa validité) ou simplement injoignable, on essaie le
+    /// suivant plutôt que d'échouer directement sur un seul point de
+    /// défaillance. Les trois sont des clusters publics officiels listés sur
+    /// https://xrpl.org/docs/tutorials/public-servers.
+    fn rpc_candidates(&self) -> &'static [&'static str] {
         match self {
             // Serveur public officiel du Testnet XRPL.
-            Network::Testnet => "https://s.altnet.rippletest.net:51234/",
-            // Cluster public "full history" recommandé pour le Mainnet.
-            Network::Mainnet => "https://xrplcluster.com/",
+            Network::Testnet => &["https://s.altnet.rippletest.net:51234/"],
+            Network::Mainnet => &[
+                "https://xrplcluster.com/",
+                "https://s1.ripple.com:51234/",
+                "https://s2.ripple.com:51234/",
+            ],
         }
     }
 
@@ -58,12 +69,12 @@ impl Network {
     }
 }
 
-async fn rpc_call(network: Network, method: &str, params: Value) -> Result<Value, String> {
+async fn rpc_call_at(rpc_url: &str, method: &str, params: Value) -> Result<Value, String> {
     let client = reqwest::Client::new();
     let body = json!({ "method": method, "params": [params] });
 
     let resp = client
-        .post(network.rpc_url())
+        .post(rpc_url)
         .json(&body)
         .timeout(NETWORK_TIMEOUT)
         .send()
@@ -89,6 +100,82 @@ async fn rpc_call(network: Network, method: &str, params: Value) -> Result<Value
     }
 
     Ok(result)
+}
+
+/// Un échec est considéré comme un problème DE SERVEUR (justifiant d'essayer
+/// le candidat suivant) plutôt qu'une réponse légitime du protocole (comme
+/// `actNotFound` pour un compte qui n'existe vraiment pas -- ça, tout noeud
+/// honnête répondrait pareil, donc inutile/trompeur de réessayer ailleurs).
+fn is_server_health_issue(err: &str) -> bool {
+    err.contains("amendmentBlocked")
+        || err.starts_with("Erreur réseau")
+        || err.starts_with("Réponse invalide")
+        || err.contains("Champ 'result' manquant")
+}
+
+async fn rpc_call(network: Network, method: &str, params: Value) -> Result<Value, String> {
+    let candidates = network.rpc_candidates();
+    let mut last_err = String::new();
+
+    for (i, url) in candidates.iter().enumerate() {
+        match rpc_call_at(url, method, params.clone()).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let is_last = i == candidates.len() - 1;
+                last_err = format!("{} : {}", url, e);
+                if is_last || !is_server_health_issue(&e) {
+                    return Err(last_err);
+                }
+                // Sinon : problème de serveur détecté, on essaie le candidat suivant.
+            }
+        }
+    }
+
+    Err(last_err)
+}
+
+/// Vérifie qu'un serveur XRPL donné n'est pas "amendment blocked" -- c-à-d
+/// en retard sur des amendements déjà activés par le reste du réseau, auquel
+/// cas il refuse TOUTE soumission de transaction indépendamment de sa
+/// validité (voir https://xrpl.org/docs/infrastructure/troubleshooting/server-is-amendment-blocked).
+/// Utilisé comme vérification préalable avant de construire/signer/soumettre
+/// un paiement, pour donner une erreur claire immédiatement plutôt qu'un
+/// échec confus en plein milieu de la soumission via `xrpl_mithril`.
+async fn check_server_health(rpc_url: &str) -> Result<(), String> {
+    let result = rpc_call_at(rpc_url, "server_info", json!({})).await?;
+
+    let blocked = result
+        .get("info")
+        .and_then(|i| i.get("amendment_blocked"))
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+
+    if blocked {
+        return Err("amendment_blocked=true (serveur en retard sur des amendements déjà activés par le réseau, ne peut traiter aucune transaction)".to_string());
+    }
+
+    Ok(())
+}
+
+/// Choisit le premier serveur RPC sain parmi les candidats du réseau donné.
+/// Sur mainnet notamment, s'il y en a plusieurs et que le premier est
+/// bloqué/injoignable, essaie les suivants avant d'abandonner.
+async fn pick_healthy_rpc_url(network: Network) -> Result<&'static str, String> {
+    let candidates = network.rpc_candidates();
+    let mut last_err = String::new();
+
+    for url in candidates {
+        match check_server_health(url).await {
+            Ok(()) => return Ok(*url),
+            Err(e) => last_err = format!("{} : {}", url, e),
+        }
+    }
+
+    Err(format!(
+        "Aucun serveur XRPL disponible pour {} (dernier essai -- {})",
+        network.label(),
+        last_err
+    ))
 }
 
 /// Convertit un montant en drops (chaîne, ex: "999999999960") en chaîne XRP
@@ -368,7 +455,13 @@ pub async fn send_payment(
         .build()
         .map_err(|e| format!("Erreur construction tx : {:?}", e))?;
 
-    let client = JsonRpcClient::new(network.rpc_url())
+    // Choisit un serveur RPC sain (pas "amendment blocked") parmi les
+    // candidats connus pour ce réseau -- voir `pick_healthy_rpc_url`. Donne
+    // une erreur claire immédiatement si aucun n'est disponible, plutôt
+    // qu'un échec confus renvoyé depuis le milieu de `xrpl_mithril`.
+    let rpc_url = pick_healthy_rpc_url(network).await?;
+
+    let client = JsonRpcClient::new(rpc_url)
         .map_err(|e| format!("Erreur connexion : {:?}", e))?;
 
     // `autofill` interroge l'état du compte ÉMETTEUR (Sequence, Fee,
