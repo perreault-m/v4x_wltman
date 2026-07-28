@@ -192,7 +192,7 @@ src/
 
 ## License
 
-*Add your chosen license here.*
+This software is distributed under the "Do What The Fuck You Want With It" license.
 
 ---
 
