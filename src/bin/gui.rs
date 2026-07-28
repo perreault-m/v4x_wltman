@@ -1,17 +1,22 @@
-// Binaire GUI indépendant du CLI. Compilé séparément : `cargo run --bin gui`
-//
-// SÉCURITÉ : ce processus ne déchiffre JAMAIS de wallet lui-même. "Charger un
-// wallet", "solde/transactions" et "envoyer" appellent tous le binaire `cli`
-// en sous-processus. La clé privée n'existe donc jamais dans la mémoire de la
-// GUI -- seulement, brièvement, dans le processus `cli` enfant, qui se termine
-// juste après chaque opération.
+//! GUI binary for the V4X Wallet Manager.
+//!
+//! Independent of the CLI, compiled separately: `cargo run --bin gui`.
+//!
+//! Security: this process NEVER decrypts a wallet itself. "Loading a
+//! wallet", "balance/transactions", and "send" all invoke the `cli` binary
+//! as a subprocess. The private key therefore never exists in the GUI's
+//! memory -- only, briefly, in the child `cli` process, which terminates
+//! right after each operation.
+//!
+//! Author: Michael.P for V4X
+//! Date: 2026-07-22
 
 #[path = "../wallet.rs"]
 mod wallet;
 
 use iced::widget::{
-    button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, scrollable,
-    stack, text, text_input, toggler, Column,
+    button, center, checkbox, column, container, mouse_area, opaque, pick_list, qr_code, row,
+    scrollable, stack, text, text_input, toggler, Column,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Size, Task, Theme};
 use serde::Deserialize;
@@ -22,7 +27,7 @@ use std::time::Duration;
 
 use wallet::{Wallet, WalletFile};
 
-// --- Palette "V4X" : vert technologique sur fond très sombre ---
+// --- "V4X" palette: technological green on a very dark background ---
 const ACCENT: Color = Color::from_rgb(0.0, 0.95, 0.35);
 const ACCENT_HOVER: Color = Color::from_rgb(0.25, 1.0, 0.55);
 const ACCENT_PRESS: Color = Color::from_rgb(0.0, 0.65, 0.25);
@@ -31,15 +36,29 @@ const WARNING_HOVER: Color = Color::from_rgb(1.0, 0.75, 0.25);
 const SUCCESS: Color = Color::from_rgb(0.25, 0.95, 0.45);
 const ERROR: Color = Color::from_rgb(1.0, 0.35, 0.35);
 const MUTED: Color = Color::from_rgb(0.55, 0.68, 0.6);
-/// Orange brûlé utilisé pour les titres de panneaux ("PORTEFEUILLE",
-/// "ACTIONS", "SOLDE & TRANSACTIONS"), pour les distinguer du vert d'accent
-/// utilisé ailleurs (adresses, états actifs, etc).
+/// Burnt orange used for panel titles ("PORTEFEUILLE", "ACTIONS",
+/// "SOLDE & TRANSACTIONS"), to distinguish them from the green accent used
+/// elsewhere (addresses, active states, etc).
 const TITLE_COLOR: Color = Color::from_rgb(0.80, 0.40, 0.12);
 const PAGE_BG: Color = Color::from_rgb(0.02, 0.03, 0.025);
 const PANEL_BG: Color = Color::from_rgb(0.05, 0.08, 0.06);
 const PANEL_BORDER: Color = Color::from_rgba(0.0, 0.95, 0.35, 0.25);
 
 const V4X_PREFIX: &str = "RV4X";
+
+// --- Donation addresses ---
+// Published openly and in plain text on purpose: this project is meant to be
+// auditable, and obfuscating these wouldn't stop anyone with the source from
+// finding/changing them anyway. If you want these to be verifiable against
+// something other than "trust the source code", set the XRPL `Domain` field
+// on these accounts and publish a matching `xrp-ledger.toml` on your
+// project's official website (see https://xrpl.org/docs/references/xrp-ledger-toml) --
+// that lets anyone (or an explorer like Bithomp) confirm these addresses are
+// really controlled by you, independently of this binary.
+//
+// TODO: replace these with your real XRPL addresses before shipping.
+const CREATOR_DONATION_ADDRESS: &str = "rREPLACE_WITH_CREATOR_ADDRESS00000";
+const DEV_DONATION_ADDRESS: &str = "rREPLACE_WITH_DEV_ADDRESS000000000";
 
 fn main() -> iced::Result {
     iced::application(MyApp::title, MyApp::update, MyApp::view)
@@ -49,7 +68,7 @@ fn main() -> iced::Result {
         .run()
 }
 
-// ============================== Sous-processus CLI ==============================
+// ============================== CLI subprocess ==============================
 
 fn cli_binary_path() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cli"));
@@ -61,18 +80,18 @@ fn cli_binary_path() -> PathBuf {
     dir.join(name)
 }
 
-/// Lance le binaire `cli` avec les arguments donnés et retourne son stdout (JSON).
-/// Bloquant : à appeler uniquement depuis un thread d'arrière-plan.
+/// Runs the `cli` binary with the given arguments and returns its stdout
+/// (JSON). Blocking: only call from a background thread.
 fn run_cli(args: Vec<String>) -> Result<String, String> {
     run_cli_with_stdin(args, None)
 }
 
-/// Variante de `run_cli` qui peut transmettre une donnée sensible (mot de passe)
-/// via le pipe stdin du sous-processus plutôt qu'en argument de ligne de commande
-/// -- ça évite qu'elle apparaisse dans la liste des processus (`ps`/gestionnaire
-/// de tâches). On écrit la donnée puis on ferme immédiatement le pipe : le CLI
-/// lit jusqu'à EOF sans jamais attendre une saisie clavier, donc ce n'est pas
-/// interactif ni bloquant au-delà de ce que `run_cli` fait déjà.
+/// Variant of `run_cli` that can pass sensitive data (a password) through
+/// the subprocess's stdin pipe rather than as a command-line argument --
+/// this avoids it showing up in the process list (`ps`/task manager). The
+/// data is written then the pipe is closed immediately: the CLI reads until
+/// EOF without ever waiting for keyboard input, so this is neither
+/// interactive nor any more blocking than `run_cli` already is.
 fn run_cli_with_stdin(args: Vec<String>, stdin_input: Option<&str>) -> Result<String, String> {
     use std::io::Write;
     use std::process::Stdio;
@@ -94,8 +113,8 @@ fn run_cli_with_stdin(args: Vec<String>, stdin_input: Option<&str>) -> Result<St
     if let Some(data) = stdin_input {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(data.as_bytes());
-            // `stdin` est droppé ici -> le pipe se ferme -> le CLI voit EOF
-            // immédiatement, il n'attend jamais de saisie clavier.
+            // `stdin` is dropped here -> the pipe closes -> the CLI sees EOF
+            // immediately, it never waits for keyboard input.
         }
     }
 
@@ -124,6 +143,7 @@ enum Modal {
     Create,
     Load,
     Send,
+    CopySeed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -142,22 +162,33 @@ impl NetworkChoice {
     }
 }
 
+/// What to do with the seed once it's been fetched from the `cli` process --
+/// set right before the fetch starts, consulted when the result comes back
+/// in `Message::TickCopySeed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SeedAction {
+    #[default]
+    Copy,
+    ShowQr,
+}
+
 type GenOutcome = Result<(String, Wallet, PathBuf, bool), String>;
-/// (adresse, clé publique) -- jamais la clé privée.
+/// (address, public key) -- never the private key.
 type LoadOutcome = Result<(String, String), String>;
 type InfoOutcome = Result<(BalanceInfo, Vec<TxInfo>), String>;
 type SendOutcome = Result<String, String>;
 type FaucetOutcome = Result<(), String>;
 
-/// Un wallet "déverrouillé" pour la session : seulement son adresse (jamais sa
-/// clé privée). Il faudra re-saisir le mot de passe pour envoyer une transaction.
+/// A wallet "unlocked" for the session: only its address (never its
+/// private key). The password will need to be re-entered to send a
+/// transaction.
 #[derive(Debug, Clone)]
 struct UnlockedWallet {
     name: String,
     address: String,
     path: PathBuf,
-    /// Vrai si le fichier de ce wallet est chiffré (`*.encrypted.json`) --
-    /// détermine si un mot de passe est nécessaire pour l'envoi.
+    /// True if this wallet's file is encrypted (`*.encrypted.json`) --
+    /// determines whether a password is required to send from it.
     encrypted: bool,
 }
 
@@ -182,11 +213,12 @@ struct MyApp {
     modal: Modal,
     network: NetworkChoice,
 
-    // --- création ---
+    // --- creation ---
     wallet_name_input: String,
     use_v4x_address: bool,
     use_encryption: bool,
     password_input: String,
+    password_confirm_input: String,
     generating: bool,
     attempts: Arc<AtomicU64>,
     cancel_flag: Arc<AtomicBool>,
@@ -194,7 +226,7 @@ struct MyApp {
     create_error: Option<String>,
     create_success: Option<String>,
 
-    // --- chargement (déverrouillage, adresse seulement) ---
+    // --- loading (unlocking, address only) ---
     available_wallets: Vec<WalletFile>,
     selected_wallet_file: Option<WalletFile>,
     load_password: String,
@@ -202,24 +234,24 @@ struct MyApp {
     loading: bool,
     load_result: Arc<Mutex<Option<LoadOutcome>>>,
 
-    // --- session : wallets déverrouillés (adresse uniquement) ---
+    // --- session: unlocked wallets (address only) ---
     unlocked_wallets: Vec<UnlockedWallet>,
     selected_unlocked: Option<String>,
 
-    // --- solde + transactions du wallet actif ---
+    // --- active wallet's balance + transactions ---
     info_loading: bool,
     info_error: Option<String>,
     current_balance: Option<BalanceInfo>,
     current_txs: Vec<TxInfo>,
     info_result: Arc<Mutex<Option<InfoOutcome>>>,
 
-    // --- faucet (testnet uniquement) ---
+    // --- faucet (testnet only) ---
     faucet_requesting: bool,
     faucet_message: Option<String>,
     faucet_error: Option<String>,
     faucet_result: Arc<Mutex<Option<FaucetOutcome>>>,
 
-    // --- envoi ---
+    // --- send ---
     send_destination: String,
     send_amount: String,
     send_destination_tag: String,
@@ -229,18 +261,45 @@ struct MyApp {
     send_error: Option<String>,
     send_success: Option<String>,
     send_result: Arc<Mutex<Option<SendOutcome>>>,
+    /// Snapshot of the destination/amount/tag taken at the moment the user
+    /// confirmed the review step. The confirmation screen renders these
+    /// instead of the live `send_*` fields, so that clearing the form after
+    /// a successful send (or any other later mutation) can never make the
+    /// confirmation screen appear to show an empty destination.
+    confirmed_destination: String,
+    confirmed_amount: String,
+    confirmed_destination_tag: String,
 
-    // --- vérification d'activation du destinataire (avant envoi) ---
+    // --- destination activation check (before sending) ---
     dest_check_loading: bool,
     dest_check_error: Option<String>,
-    /// `Some(false)` = le compte destinataire n'existe pas encore sur le
-    /// réseau (jamais activé) -- l'envoi va donc créer/activer ce compte.
+    /// `Some(false)` = the destination account does not exist on the network
+    /// yet (never activated) -- the send will therefore create/activate it.
     dest_activated: Option<bool>,
     dest_check_result: Arc<Mutex<Option<Result<bool, String>>>>,
-    /// L'utilisateur a coché la case reconnaissant qu'il active un nouveau
-    /// compte. Requis avant de pouvoir confirmer l'envoi si `dest_activated
-    /// == Some(false)`.
+    /// Whether the user checked the box acknowledging they're activating a
+    /// new account. Required before the send can be confirmed if
+    /// `dest_activated == Some(false)`.
     activation_acknowledged: bool,
+
+    // --- copy seed to clipboard ---
+    copy_seed_password: String,
+    copy_seed_error: Option<String>,
+    copy_seed_success: Option<String>,
+    copy_seed_loading: bool,
+    /// Holds the seed only transiently, on the handoff from the background
+    /// thread to the update loop -- it is never stored anywhere else and is
+    /// consumed (copied to the clipboard, then dropped) as soon as it's read.
+    copy_seed_result: Arc<Mutex<Option<Result<String, String>>>>,
+    /// Which action ("copy" or "show as QR") the current fetch was started
+    /// for.
+    seed_action: SeedAction,
+    /// The seed, rendered as QR data, kept only while the modal displaying
+    /// it is open (cleared on close). Note that this visually encodes the
+    /// same secret as the seed string itself -- rendering it as an image
+    /// rather than text doesn't reduce what's held in memory, only how it's
+    /// displayed.
+    copy_seed_qr: Option<qr_code::Data>,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +307,10 @@ enum Message {
     OpenCreateModal,
     OpenLoadModal,
     OpenSendModal,
+    /// Opens the send modal with the destination pre-filled to one of the
+    /// donation addresses above, so the existing send flow (review,
+    /// confirmation, activation warning, etc.) is reused as-is.
+    OpenDonationSend(&'static str),
     CloseModal,
 
     NetworkChanged(NetworkChoice),
@@ -256,6 +319,7 @@ enum Message {
     V4xAddressToggled(bool),
     EncryptionToggled(bool),
     PasswordChanged(String),
+    PasswordConfirmChanged(String),
     GenerateWallet,
     CancelGeneration,
     TickGenerate,
@@ -273,6 +337,7 @@ enum Message {
     TickFaucet,
 
     SendDestinationChanged(String),
+    PasteDestination,
     SendAmountChanged(String),
     SendDestinationTagChanged(String),
     SendPasswordChanged(String),
@@ -284,6 +349,19 @@ enum Message {
     AcknowledgeActivation(bool),
 
     CopyAddress(String),
+    /// Checks whether the clipboard still holds the value we wrote (given
+    /// as the payload), and clears it if so. Scheduled 60 seconds after a
+    /// seed copy; does nothing if the user has since copied something else.
+    ClipboardAutoClearCheck(String),
+    ClipboardAutoClearConfirmed,
+    /// No-op, used as the "don't clear" branch of the clipboard read above.
+    Noop,
+
+    OpenCopySeedModal,
+    CopySeedPasswordChanged(String),
+    CopySeedToClipboard,
+    ShowSeedQr,
+    TickCopySeed,
 }
 
 impl MyApp {
@@ -295,8 +373,8 @@ impl MyApp {
         Theme::Dark
     }
 
-    /// Programme un prochain message après un court délai (utilisé pour tout
-    /// polling de tâche d'arrière-plan : génération, chargement, solde, envoi).
+    /// Schedules a follow-up message after a short delay (used for all
+    /// background task polling: generation, loading, balance, send).
     fn schedule(message: Message) -> Task<Message> {
         Task::perform(
             async { tokio::time::sleep(Duration::from_millis(200)).await },
@@ -304,9 +382,9 @@ impl MyApp {
         )
     }
 
-    /// (Re)lance la récupération du solde + des dernières transactions pour le
-    /// wallet actuellement sélectionné, sur le réseau actuellement choisi.
-    /// Ne nécessite que l'adresse -- aucun mot de passe.
+    /// (Re)starts fetching the balance + latest transactions for the
+    /// currently selected wallet, on the currently selected network. Only
+    /// requires the address -- no password.
     fn trigger_refresh(&mut self) -> Task<Message> {
         self.info_error = None;
 
@@ -366,6 +444,69 @@ impl MyApp {
         Self::schedule(Message::TickInfo)
     }
 
+    /// Starts fetching the currently selected wallet's seed from the `cli`
+    /// subprocess (via `--decrypt`), for the given [`SeedAction`]. Shared by
+    /// both "copy to clipboard" and "show as QR code", which only differ in
+    /// what they do with the seed once `Message::TickCopySeed` receives it.
+    fn start_seed_fetch(&mut self, action: SeedAction) -> Task<Message> {
+        self.copy_seed_error = None;
+        self.copy_seed_success = None;
+        self.copy_seed_qr = None;
+
+        let wallet = match self
+            .selected_unlocked
+            .as_ref()
+            .and_then(|name| self.unlocked_wallets.iter().find(|w| &w.name == name))
+        {
+            Some(w) => w.clone(),
+            None => {
+                self.copy_seed_error = Some("Aucun wallet sélectionné.".into());
+                return Task::none();
+            }
+        };
+
+        if wallet.encrypted && self.copy_seed_password.is_empty() {
+            self.copy_seed_error = Some("Mot de passe manquant.".into());
+            return Task::none();
+        }
+
+        self.seed_action = action;
+        self.copy_seed_loading = true;
+        *self.copy_seed_result.lock().unwrap() = None;
+
+        let result_slot = Arc::clone(&self.copy_seed_result);
+        let path_str = wallet.path.to_string_lossy().to_string();
+        let wallet_encrypted = wallet.encrypted;
+        let password = self.copy_seed_password.clone();
+
+        std::thread::spawn(move || {
+            let mut args = vec!["--decrypt".to_string(), "-f".to_string(), path_str];
+            let stdin_payload = if wallet_encrypted {
+                args.push("--password-stdin".to_string());
+                Some(password)
+            } else {
+                None
+            };
+
+            let outcome: Result<String, String> =
+                run_cli_with_stdin(args, stdin_payload.as_deref()).and_then(|s| {
+                    let v: serde_json::Value = serde_json::from_str(&s)
+                        .map_err(|_| "Réponse CLI invalide.".to_string())?;
+                    v.get("seed")
+                        .and_then(|h| h.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .ok_or("Ce wallet n'a pas de seed (recréez-le).".to_string())
+                });
+
+            *result_slot.lock().unwrap() = Some(outcome);
+        });
+
+        self.copy_seed_password.clear();
+
+        Self::schedule(Message::TickCopySeed)
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::OpenCreateModal => {
@@ -375,6 +516,7 @@ impl MyApp {
                     self.use_v4x_address = false;
                     self.use_encryption = false;
                     self.password_input.clear();
+                    self.password_confirm_input.clear();
                     self.create_error = None;
                     self.create_success = None;
                 }
@@ -400,10 +542,36 @@ impl MyApp {
                     self.dest_check_error = None;
                     self.dest_activated = None;
                     self.activation_acknowledged = false;
+                    self.confirmed_destination.clear();
+                    self.confirmed_amount.clear();
+                    self.confirmed_destination_tag.clear();
+                }
+            }
+            Message::OpenDonationSend(address) => {
+                self.modal = Modal::Send;
+                if !self.sending {
+                    self.send_destination = address.to_string();
+                    self.send_amount.clear();
+                    self.send_destination_tag.clear();
+                    self.send_password.clear();
+                    self.send_confirming = false;
+                    self.send_error = None;
+                    self.send_success = None;
+                    self.dest_check_loading = false;
+                    self.dest_check_error = None;
+                    self.dest_activated = None;
+                    self.activation_acknowledged = false;
+                    self.confirmed_destination.clear();
+                    self.confirmed_amount.clear();
+                    self.confirmed_destination_tag.clear();
                 }
             }
             Message::CloseModal => {
                 self.modal = Modal::None;
+                self.copy_seed_qr = None;
+                self.copy_seed_password.clear();
+                self.copy_seed_error = None;
+                self.copy_seed_success = None;
             }
 
             Message::NetworkChanged(net) => {
@@ -422,6 +590,7 @@ impl MyApp {
             Message::V4xAddressToggled(v) => self.use_v4x_address = v,
             Message::EncryptionToggled(v) => self.use_encryption = v,
             Message::PasswordChanged(s) => self.password_input = s,
+            Message::PasswordConfirmChanged(s) => self.password_confirm_input = s,
 
             Message::GenerateWallet => {
                 self.create_error = None;
@@ -430,6 +599,14 @@ impl MyApp {
                 let name = self.wallet_name_input.trim().to_string();
                 if name.is_empty() {
                     self.create_error = Some("Veuillez entrer un nom pour le wallet.".into());
+                    return Task::none();
+                }
+
+                // Both password fields must match -- this is the user's only
+                // confirmation that they typed the password they meant to,
+                // since it's masked as they type.
+                if self.use_encryption && self.password_input != self.password_confirm_input {
+                    self.create_error = Some("Les mots de passe ne correspondent pas.".into());
                     return Task::none();
                 }
 
@@ -687,6 +864,10 @@ impl MyApp {
             }
 
             Message::SendDestinationChanged(s) => self.send_destination = s,
+            Message::PasteDestination => {
+                return iced::clipboard::read()
+                    .map(|maybe_text| Message::SendDestinationChanged(maybe_text.unwrap_or_default()));
+            }
             Message::SendAmountChanged(s) => self.send_amount = s,
             Message::SendDestinationTagChanged(s) => self.send_destination_tag = s,
             Message::SendPasswordChanged(s) => self.send_password = s,
@@ -721,9 +902,9 @@ impl MyApp {
                         Some("Destination tag invalide (doit être un nombre entier).".into());
                     return Task::none();
                 }
-                // Un mot de passe n'est nécessaire que si ce wallet est
-                // effectivement chiffré -- un wallet non chiffré peut être
-                // utilisé pour l'envoi sans mot de passe.
+                // A password is only required if this wallet is actually
+                // encrypted -- an unencrypted wallet can be used to send
+                // without a password.
                 if wallet_encrypted && self.send_password.is_empty() {
                     self.send_error = Some("Mot de passe manquant.".into());
                     return Task::none();
@@ -736,11 +917,21 @@ impl MyApp {
                 self.dest_check_loading = true;
                 *self.dest_check_result.lock().unwrap() = None;
 
-                // Vérifie si le compte destinataire existe déjà sur le réseau
-                // (n'a besoin que de l'adresse -- aucun mot de passe). Permet
-                // d'avertir l'utilisateur si cet envoi va activer un compte
-                // qui n'existe pas encore.
-                let destination = self.send_destination.trim().to_string();
+                // Freeze the values the user actually typed at confirmation
+                // time. The confirmation screen renders from these snapshots
+                // rather than the live `send_*` fields, so it can never show
+                // a stale/empty destination if the form gets cleared later
+                // (e.g. after a successful send) while this screen is still
+                // showing the result.
+                self.confirmed_destination = self.send_destination.trim().to_string();
+                self.confirmed_amount = self.send_amount.trim().to_string();
+                self.confirmed_destination_tag = tag_input.to_string();
+
+                // Checks whether the destination account already exists on
+                // the network (only needs the address -- no password). Lets
+                // us warn the user if this send would activate an account
+                // that doesn't exist yet.
+                let destination = self.confirmed_destination.clone();
                 let network = self.network.as_str().to_string();
                 let result_slot = Arc::clone(&self.dest_check_result);
 
@@ -795,13 +986,90 @@ impl MyApp {
                 return iced::clipboard::write(address);
             }
 
+            Message::OpenCopySeedModal => {
+                self.modal = Modal::CopySeed;
+                self.copy_seed_password.clear();
+                self.copy_seed_error = None;
+                self.copy_seed_success = None;
+                self.copy_seed_loading = false;
+                self.copy_seed_qr = None;
+                *self.copy_seed_result.lock().unwrap() = None;
+            }
+            Message::CopySeedPasswordChanged(s) => self.copy_seed_password = s,
+            Message::CopySeedToClipboard => return self.start_seed_fetch(SeedAction::Copy),
+            Message::ShowSeedQr => return self.start_seed_fetch(SeedAction::ShowQr),
+            Message::TickCopySeed => {
+                if self.copy_seed_loading {
+                    let mut slot = self.copy_seed_result.lock().unwrap();
+                    if let Some(outcome) = slot.take() {
+                        self.copy_seed_loading = false;
+                        drop(slot);
+                        match outcome {
+                            // The seed only ever exists here, momentarily, as
+                            // a local variable -- it's either handed straight
+                            // to the clipboard or rendered into a QR image,
+                            // and never stored as plain text in any struct
+                            // field.
+                            Ok(seed) => match self.seed_action {
+                                SeedAction::Copy => {
+                                    self.copy_seed_success = Some(
+                                        "Seed copiée dans le presse-papiers (effacement automatique dans 60s).".into(),
+                                    );
+                                    let seed_for_clear = seed.clone();
+                                    return Task::batch([
+                                        iced::clipboard::write(seed),
+                                        Task::perform(
+                                            async move {
+                                                tokio::time::sleep(Duration::from_secs(60)).await;
+                                                seed_for_clear
+                                            },
+                                            Message::ClipboardAutoClearCheck,
+                                        ),
+                                    ]);
+                                }
+                                SeedAction::ShowQr => match qr_code::Data::new(&seed) {
+                                    Ok(data) => {
+                                        self.copy_seed_qr = Some(data);
+                                        self.copy_seed_success = Some(
+                                            "QR code généré. Fermez cette fenêtre une fois le scan terminé.".into(),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        self.copy_seed_error = Some(format!("Erreur QR : {:?}", e))
+                                    }
+                                },
+                            },
+                            Err(e) => self.copy_seed_error = Some(e),
+                        }
+                    } else {
+                        drop(slot);
+                        return Self::schedule(Message::TickCopySeed);
+                    }
+                }
+            }
+            Message::ClipboardAutoClearCheck(expected) => {
+                return iced::clipboard::read().map(move |current| {
+                    if current.as_deref() == Some(expected.as_str()) {
+                        Message::ClipboardAutoClearConfirmed
+                    } else {
+                        // The user copied something else in the meantime --
+                        // leave the clipboard alone.
+                        Message::Noop
+                    }
+                });
+            }
+            Message::ClipboardAutoClearConfirmed => {
+                return iced::clipboard::write(String::new());
+            }
+            Message::Noop => {}
+
             Message::SendTransaction => {
                 self.send_error = None;
                 self.send_success = None;
 
-                // Si le destinataire est confirmé comme non activé, l'utilisateur
-                // doit avoir explicitement coché la case d'avertissement avant
-                // qu'on ne signe/soumette quoi que ce soit.
+                // If the destination is confirmed as not activated, the user
+                // must have explicitly checked the warning box before we
+                // sign/submit anything.
                 if self.dest_activated == Some(false) && !self.activation_acknowledged {
                     self.send_error = Some(
                         "Veuillez cocher la case confirmant l'activation du nouveau compte."
@@ -829,9 +1097,9 @@ impl MyApp {
                 let path_str = wallet.path.to_string_lossy().to_string();
                 let wallet_encrypted = wallet.encrypted;
                 let password = self.send_password.clone();
-                let destination = self.send_destination.clone();
-                let amount = self.send_amount.clone();
-                let destination_tag = self.send_destination_tag.trim().to_string();
+                let destination = self.confirmed_destination.clone();
+                let amount = self.confirmed_amount.clone();
+                let destination_tag = self.confirmed_destination_tag.clone();
                 let network = self.network.as_str().to_string();
 
                 std::thread::spawn(move || {
@@ -851,9 +1119,9 @@ impl MyApp {
                         args.push(destination_tag);
                     }
 
-                    // Un wallet non chiffré n'a pas besoin de mot de passe --
-                    // on n'envoie `--password-stdin` (et la donnée sur stdin)
-                    // que si ce wallet est effectivement chiffré.
+                    // An unencrypted wallet doesn't need a password -- only
+                    // send `--password-stdin` (and the stdin payload) if
+                    // this wallet is actually encrypted.
                     let stdin_payload = if wallet_encrypted {
                         args.push("--password-stdin".to_string());
                         Some(password)
@@ -915,6 +1183,7 @@ impl MyApp {
             Modal::Create => modal(base, self.create_modal_view(), Message::CloseModal),
             Modal::Load => modal(base, self.load_modal_view(), Message::CloseModal),
             Modal::Send => modal(base, self.send_modal_view(), Message::CloseModal),
+            Modal::CopySeed => modal(base, self.copy_seed_modal_view(), Message::CloseModal),
         }
     }
 
@@ -926,8 +1195,10 @@ impl MyApp {
             ]
             .spacing(0),
             iced::widget::horizontal_space(),
+            self.donation_buttons(),
             self.network_toggle(),
         ]
+        .spacing(20)
         .align_y(Alignment::Center)
         .width(Length::Fill);
 
@@ -958,8 +1229,35 @@ impl MyApp {
             .into()
     }
 
-    /// Switch testnet/mainnet, avec un libellé de chaque côté qui s'éclaire
-    /// pour indiquer clairement l'état actif (orange = mainnet = argent réel).
+    /// Testnet/mainnet switch, with a label on each side that lights up to
+    /// clearly indicate the active state (orange = mainnet = real money).
+    /// Small, unobtrusive donation shortcuts -- pre-fill the destination in
+    /// the existing send flow rather than introducing a separate one, so
+    /// they benefit from the same review/confirmation/activation-warning
+    /// steps as any other transaction. Disabled until a wallet is selected,
+    /// same as the regular send action.
+    fn donation_buttons(&self) -> Element<Message> {
+        let has_selection = self.selected_unlocked.is_some();
+
+        row![
+            button(text("Soutenir le créateur").size(12))
+                .padding([6, 10])
+                .style(secondary_button)
+                .on_press_maybe(
+                    has_selection.then_some(Message::OpenDonationSend(CREATOR_DONATION_ADDRESS))
+                ),
+            button(text("Soutenir le développeur").size(12))
+                .padding([6, 10])
+                .style(secondary_button)
+                .on_press_maybe(
+                    has_selection.then_some(Message::OpenDonationSend(DEV_DONATION_ADDRESS))
+                ),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+    }
+
     fn network_toggle(&self) -> Element<Message> {
         let is_mainnet = self.network == NetworkChoice::Mainnet;
 
@@ -983,10 +1281,9 @@ impl MyApp {
         .into()
     }
 
-    /// Panneau du haut : sélection/gestion du wallet actif (choisir, créer,
-    /// charger) + adresse et bouton de copie du wallet actuellement
-    /// sélectionné, le tout sur une largeur pleine et compacte plutôt
-    /// qu'étalé verticalement.
+    /// Top panel: selecting/managing the active wallet (choose, create,
+    /// load) + the currently selected wallet's address and copy button, all
+    /// on a compact full-width bar rather than spread out vertically.
     fn wallet_top_panel(&self) -> Element<Message> {
         let names: Vec<String> = self.unlocked_wallets.iter().map(|w| w.name.clone()).collect();
 
@@ -1019,6 +1316,10 @@ impl MyApp {
                         .padding([4, 10])
                         .style(secondary_button)
                         .on_press(Message::CopyAddress(w.address.clone())),
+                    button(text("Copier la seed").size(12))
+                        .padding([4, 10])
+                        .style(secondary_button)
+                        .on_press(Message::OpenCopySeedModal),
                 ]
                 .spacing(10)
                 .align_y(Alignment::Center),
@@ -1035,7 +1336,7 @@ impl MyApp {
         column![controls, address_line].spacing(14).into()
     }
 
-    /// Actions sur le wallet actif : envoyer, rafraîchir, faucet (testnet).
+    /// Actions on the active wallet: send, refresh, faucet (testnet).
     fn actions_panel(&self) -> Element<Message> {
         let has_selection = self.selected_unlocked.is_some();
 
@@ -1054,7 +1355,7 @@ impl MyApp {
                 .into(),
         ];
 
-        // Le faucet n'existe que sur testnet -- invisible sur mainnet.
+        // The faucet only exists on testnet -- invisible on mainnet.
         if self.network == NetworkChoice::Testnet {
             items.push(
                 button(
@@ -1153,6 +1454,23 @@ impl MyApp {
                     .padding(10)
                     .into(),
             );
+            items.push(
+                text_input("Confirmer le mot de passe", &self.password_confirm_input)
+                    .on_input(Message::PasswordConfirmChanged)
+                    .secure(true)
+                    .padding(10)
+                    .into(),
+            );
+            if !self.password_confirm_input.is_empty()
+                && self.password_input != self.password_confirm_input
+            {
+                items.push(
+                    text("Les mots de passe ne correspondent pas.")
+                        .size(12)
+                        .color(WARNING)
+                        .into(),
+                );
+            }
         }
 
         if self.generating {
@@ -1184,14 +1502,15 @@ impl MyApp {
                     .into(),
             );
         } else {
+            let passwords_ok =
+                !self.use_encryption || self.password_input == self.password_confirm_input;
+            let can_generate = !self.wallet_name_input.trim().is_empty() && passwords_ok;
             items.push(
                 button(text("Générer").size(15))
                     .padding(12)
                     .width(Length::Fill)
                     .style(primary_button)
-                    .on_press_maybe(
-                        (!self.wallet_name_input.trim().is_empty()).then_some(Message::GenerateWallet),
-                    )
+                    .on_press_maybe(can_generate.then_some(Message::GenerateWallet))
                     .into(),
             );
         }
@@ -1285,6 +1604,93 @@ impl MyApp {
             .into()
     }
 
+    /// Password-gated modal for copying a wallet's seed to the clipboard.
+    /// The seed itself is never rendered anywhere in this view -- it only
+    /// ever exists transiently in memory during the copy operation (see
+    /// `Message::TickCopySeed`).
+    fn copy_seed_modal_view(&self) -> Element<Message> {
+        let wallet_encrypted = self
+            .selected_unlocked
+            .as_ref()
+            .and_then(|name| self.unlocked_wallets.iter().find(|w| &w.name == name))
+            .map(|w| w.encrypted)
+            .unwrap_or(false);
+
+        let mut items: Vec<Element<Message>> = vec![
+            text("Copier la seed").size(22).color(ACCENT).into(),
+            text(
+                "Cette clé donne un accès total et irrévocable aux fonds de ce wallet. \
+                 Ne la partagez avec personne et ne la collez que dans un endroit sûr."
+            )
+            .size(12)
+            .color(WARNING)
+            .into(),
+        ];
+
+        if wallet_encrypted {
+            items.push(
+                text_input("Mot de passe du wallet", &self.copy_seed_password)
+                    .on_input(Message::CopySeedPasswordChanged)
+                    .secure(true)
+                    .padding(10)
+                    .into(),
+            );
+        }
+
+        if self.copy_seed_loading {
+            items.push(text("Déchiffrement...").size(13).color(MUTED).into());
+        }
+        if let Some(err) = &self.copy_seed_error {
+            items.push(text(err).color(ERROR).into());
+        }
+        if let Some(msg) = &self.copy_seed_success {
+            items.push(text(msg).color(SUCCESS).into());
+        }
+
+        if let Some(data) = &self.copy_seed_qr {
+            items.push(
+                container(qr_code(data))
+                    .padding(12)
+                    .width(Length::Fill)
+                    .center_x(Length::Fill)
+                    .into(),
+            );
+        }
+
+        let can_act = !self.copy_seed_loading
+            && (!wallet_encrypted || !self.copy_seed_password.is_empty());
+
+        items.push(
+            button(text("Afficher le QR code").size(15))
+                .padding(12)
+                .width(Length::Fill)
+                .style(primary_button)
+                .on_press_maybe(can_act.then_some(Message::ShowSeedQr))
+                .into(),
+        );
+        items.push(
+            button(text("Copier la seed dans le presse-papiers").size(15))
+                .padding(12)
+                .width(Length::Fill)
+                .style(warning_button)
+                .on_press_maybe(can_act.then_some(Message::CopySeedToClipboard))
+                .into(),
+        );
+        items.push(
+            button(text("Fermer").size(15))
+                .padding(12)
+                .width(Length::Fill)
+                .style(secondary_button)
+                .on_press(Message::CloseModal)
+                .into(),
+        );
+
+        container(Column::with_children(items).spacing(14).width(Length::Fixed(420.0)))
+            .padding(24)
+            .style(card_style)
+            .into()
+    }
+
     fn send_modal_view(&self) -> Element<Message> {
         if self.send_confirming {
             return self.send_confirm_view();
@@ -1308,10 +1714,18 @@ impl MyApp {
                 .size(13)
                 .color(MUTED)
                 .into(),
-            text_input("Adresse destinataire (r...)", &self.send_destination)
-                .on_input(Message::SendDestinationChanged)
-                .padding(10)
-                .into(),
+            row![
+                text_input("Adresse destinataire (r...)", &self.send_destination)
+                    .on_input(Message::SendDestinationChanged)
+                    .padding(10),
+                button(text("Coller").size(13))
+                    .padding([10, 14])
+                    .style(secondary_button)
+                    .on_press(Message::PasteDestination),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into(),
             text_input("Montant en XRP", &self.send_amount)
                 .on_input(Message::SendAmountChanged)
                 .padding(10)
@@ -1322,8 +1736,8 @@ impl MyApp {
                 .into(),
         ];
 
-        // Un wallet non chiffré n'a pas de mot de passe -- inutile (et
-        // trompeur) de demander à l'utilisateur d'en saisir un.
+        // An unencrypted wallet has no password -- pointless (and
+        // misleading) to ask the user to enter one.
         if wallet_encrypted {
             items.push(
                 text_input("Mot de passe du wallet", &self.send_password)
@@ -1382,15 +1796,15 @@ impl MyApp {
             .into()
     }
 
-    /// Écran de confirmation affiché juste avant de signer/soumettre : récapitule
-    /// la transaction pour donner une dernière chance de repérer une erreur de
-    /// saisie (montant, adresse) avant qu'elle ne devienne irréversible.
+    /// Confirmation screen shown right before signing/submitting:
+    /// recaps the transaction to give one last chance to spot a data-entry
+    /// error (amount, address) before it becomes irreversible.
     fn send_confirm_view(&self) -> Element<Message> {
         let wallet_label = self
             .selected_unlocked
             .clone()
             .unwrap_or_else(|| "?".to_string());
-        let tag = self.send_destination_tag.trim();
+        let tag = self.confirmed_destination_tag.as_str();
 
         let mut items: Vec<Element<Message>> = vec![
             text("Confirmer l'envoi").size(22).color(ACCENT).into(),
@@ -1399,8 +1813,8 @@ impl MyApp {
                 .color(MUTED)
                 .into(),
             owned_info_row("Depuis", wallet_label),
-            owned_info_row("Vers", self.send_destination.trim().to_string()),
-            owned_info_row("Montant", format!("{} XRP", self.send_amount.trim())),
+            owned_info_row("Vers", self.confirmed_destination.clone()),
+            owned_info_row("Montant", format!("{} XRP", self.confirmed_amount)),
         ];
 
         if !tag.is_empty() {
@@ -1417,7 +1831,7 @@ impl MyApp {
             );
         }
 
-        // --- Statut d'activation du compte destinataire ---
+        // --- Destination account activation status ---
         if self.dest_check_loading {
             items.push(
                 text("Vérification du compte destinataire...")
@@ -1518,6 +1932,8 @@ impl MyApp {
     }
 }
 
+/// Renders a labeled, scrollable value row (e.g. "ADDRESS" / the address
+/// value).
 fn info_row<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
     column![
         text(label.to_uppercase()).size(11).color(MUTED),
@@ -1527,9 +1943,9 @@ fn info_row<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
     .into()
 }
 
-/// Variante de `info_row` pour une valeur calculée localement (ex: `format!(...)`)
-/// -- prend une `String` possédée plutôt qu'une référence, pour éviter tout
-/// problème de durée de vie avec une valeur temporaire.
+/// Variant of `info_row` for a locally computed value (e.g. `format!(...)`)
+/// -- takes an owned `String` rather than a reference, to avoid any lifetime
+/// issue with a temporary value.
 fn owned_info_row(label: &'static str, value: String) -> Element<'static, Message> {
     column![
         text(label.to_uppercase()).size(11).color(MUTED),
@@ -1539,8 +1955,8 @@ fn owned_info_row(label: &'static str, value: String) -> Element<'static, Messag
     .into()
 }
 
-/// Vérification légère (pas une validation base58check complète) pour attraper
-/// les fautes de frappe évidentes avant de demander confirmation à l'utilisateur.
+/// Lightweight check (not a full Base58Check validation) to catch obvious
+/// typos before asking the user for confirmation.
 fn looks_like_xrpl_address(addr: &str) -> bool {
     let addr = addr.trim();
     addr.starts_with('r')
@@ -1588,8 +2004,8 @@ fn tx_row(tx: &TxInfo) -> Element<'static, Message> {
     .into()
 }
 
-/// Style commun des panneaux ("cartes") : fond sombre légèrement verdâtre,
-/// bordure verte discrète, coins arrondis.
+/// Common style for panels ("cards"): slightly greenish dark background,
+/// subtle green border, rounded corners.
 fn card_style(_theme: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(PANEL_BG)),
@@ -1602,6 +2018,7 @@ fn card_style(_theme: &Theme) -> container::Style {
     }
 }
 
+/// Wraps `content` in a titled panel ("card") of the given width.
 fn card<'a>(title: &'a str, content: Element<'a, Message>, width: Length) -> Element<'a, Message> {
     container(column![text(title).size(13).color(TITLE_COLOR), content].spacing(16))
         .padding(20)
@@ -1630,8 +2047,8 @@ fn primary_button(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-/// Variante d'avertissement du bouton principal (fond orange) -- utilisée pour
-/// l'action "Envoyer" quand le réseau actif est le mainnet (argent réel).
+/// Warning variant of the primary button (orange background) -- used for the
+/// "Send" action when the active network is mainnet (real money).
 fn warning_button(_theme: &Theme, status: button::Status) -> button::Style {
     let background = match status {
         button::Status::Hovered => WARNING_HOVER,
@@ -1675,8 +2092,8 @@ fn secondary_button(_theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
-/// Superpose `content` par-dessus `base` avec un fond quasi opaque
-/// (clic en dehors du contenu = envoie `on_blur`, typiquement pour fermer le modal).
+/// Overlays `content` on top of `base` with a near-opaque background
+/// (clicking outside the content sends `on_blur`, typically to close the modal).
 fn modal<'a>(
     base: Element<'a, Message>,
     content: Element<'a, Message>,

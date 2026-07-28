@@ -1,14 +1,19 @@
-// Binaire CLI indépendant de la GUI. Compilé séparément : `cargo run --bin cli -- ...`
-//
-// Convention de sortie pensée pour être appelée depuis d'autres langages/scripts :
-//   - stdout  -> uniquement le résultat exploitable (JSON)
-//   - stderr  -> messages de progression / logs humains
-//   - code de sortie non nul en cas d'erreur
-//
-// SÉCURITÉ : les commandes `balance` et `transactions` ne nécessitent qu'une
-// adresse publique (--address), jamais de mot de passe. La commande `send`
-// déchiffre le wallet uniquement dans CE processus, qui se termine juste après
-// -- la clé privée ne persiste jamais au-delà de cet appel.
+//! Command-line binary for the V4X Wallet Manager.
+//!
+//! Independent of the GUI, compiled separately: `cargo run --bin cli -- ...`.
+//!
+//! Output convention, designed to be callable from other languages/scripts:
+//! - stdout -> machine-readable result only (JSON)
+//! - stderr -> human-readable progress/log messages
+//! - non-zero exit code on error
+//!
+//! Security: the `balance` and `transactions` commands only require a public
+//! address (`--address`), never a password. The `send` command only decrypts
+//! the wallet within THIS process, which terminates right afterwards -- the
+//! private key never persists beyond this call.
+//!
+//! Author: Michael.P for V4X
+//! Date: 2026-07-22
 
 #[path = "../wallet.rs"]
 mod wallet;
@@ -41,8 +46,9 @@ async fn main() {
     }
 }
 
-/// Lit `--network testnet|mainnet` n'importe où dans les arguments.
-/// Par défaut (et si absent/invalide) : **testnet**, par sécurité.
+/// Reads `--network testnet|mainnet` anywhere in the arguments.
+/// Defaults to (and falls back to, if absent/invalid) **testnet**, for
+/// safety.
 fn parse_network(args: &[String]) -> Network {
     for i in 0..args.len() {
         if args[i] == "--network" {
@@ -60,6 +66,7 @@ fn parse_network(args: &[String]) -> Network {
     Network::Testnet
 }
 
+/// Returns the value immediately following the given flag in `args`, if any.
 fn get_flag_value(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
@@ -67,10 +74,10 @@ fn get_flag_value(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
-/// Lit le mot de passe depuis stdin jusqu'à EOF (PAS un prompt interactif : la
-/// GUI écrit le mot de passe dans le pipe puis le ferme immédiatement, donc
-/// cette lecture retourne dès que l'appelant a fini d'écrire -- aucun blocage
-/// en attente d'une saisie clavier).
+/// Reads the password from stdin until EOF (NOT an interactive prompt: the
+/// GUI writes the password to the pipe then closes it immediately, so this
+/// read returns as soon as the caller is done writing -- no blocking while
+/// waiting for keyboard input).
 fn read_password_from_stdin() -> Result<String, String> {
     use std::io::Read;
     let mut buf = String::new();
@@ -80,9 +87,9 @@ fn read_password_from_stdin() -> Result<String, String> {
     Ok(buf.trim_end_matches(['\n', '\r']).to_string())
 }
 
-/// Résout le mot de passe : `--password-stdin` (recommandé -- n'apparaît jamais
-/// dans la liste des processus) a priorité sur `-p`/`--password` (pratique pour
-/// un usage manuel/scripts, mais visible via `ps`/gestionnaire de tâches).
+/// Resolves the password: `--password-stdin` (recommended -- never shows up
+/// in the process list) takes priority over `-p`/`--password` (convenient
+/// for manual/scripted use, but visible via `ps`/task manager).
 fn resolve_password(args: &[String]) -> Option<String> {
     if args.iter().any(|a| a == "--password-stdin") {
         match read_password_from_stdin() {
@@ -97,8 +104,9 @@ fn resolve_password(args: &[String]) -> Option<String> {
     }
 }
 
-// ============================== GÉNÉRATION ==============================
+// ============================== GENERATION ==============================
 
+/// Handles wallet generation (`cli [--vanity ...] [--encrypt ...] [--name ...]`).
 fn handle_generate(args: &[String]) {
     let mut prefixes: Vec<String> = Vec::new();
     let mut password: Option<String> = None;
@@ -166,10 +174,12 @@ fn handle_generate(args: &[String]) {
         }
     }
 
-    // Seule ligne destinée à être parsée par un programme appelant.
+    // Only line intended to be parsed by a calling program.
     println!("{}", serde_json::to_string_pretty(&w).unwrap());
 }
 
+/// Runs the vanity address search in a background-monitored loop, printing
+/// periodic progress to stderr while [`wallet::generate_vanity_wallet`] runs.
 fn generate_vanity_with_progress(prefixes: &[String]) -> Result<Option<wallet::Wallet>, String> {
     let attempts = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
@@ -196,11 +206,11 @@ fn generate_vanity_with_progress(prefixes: &[String]) -> Result<Option<wallet::W
     result
 }
 
-// ============================== DÉCHIFFREMENT ==============================
+// ============================== DECRYPTION ==============================
 
-/// Déchiffre (ou lit) un wallet et n'affiche QUE son adresse/clé publique
-/// -- jamais la clé privée. À utiliser pour "charger" un wallet sans exposer
-/// son secret.
+/// Decrypts (or reads) a wallet and prints ONLY its address/public key --
+/// never the private key. Used to "load" a wallet without exposing its
+/// secret.
 fn handle_address(args: &[String]) {
     let file = match get_flag_value(args, "-f").or_else(|| get_flag_value(args, "--file")) {
         Some(f) => f,
@@ -231,9 +241,9 @@ fn handle_address(args: &[String]) {
     }
 }
 
-/// Déchiffre un wallet et affiche son JSON complet (INCLUT la clé privée).
-/// Conservé pour compatibilité/scripting ; préférer `--address` quand la
-/// clé privée n'est pas nécessaire.
+/// Decrypts a wallet and prints its full JSON (INCLUDES the private key).
+/// Kept for compatibility/scripting; prefer `--address` when the private key
+/// isn't needed.
 fn handle_decrypt(args: &[String]) {
     let file = match get_flag_value(args, "-f").or_else(|| get_flag_value(args, "--file")) {
         Some(f) => f,
@@ -242,25 +252,50 @@ fn handle_decrypt(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let pw = match resolve_password(args) {
-        Some(p) => p,
-        None => {
-            eprintln!("Erreur : mot de passe manquant (-p/--password ou --password-stdin)");
-            std::process::exit(1);
+    let password = resolve_password(args);
+
+    // A password is only required (and used) if the file is actually
+    // encrypted (`*.encrypted.json`) -- mirrors `handle_send`'s handling so
+    // this command also works for plain-text wallets.
+    let json = if wallet::is_encrypted_file(&file) {
+        let pw = match password {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                eprintln!(
+                    "Erreur : ce wallet est chiffré, mot de passe manquant (-p/--password ou --password-stdin)"
+                );
+                std::process::exit(1);
+            }
+        };
+        match wallet::decrypt_wallet_file(&file, &pw) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("Erreur : {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match wallet::load_plain_wallet(&file) {
+            Ok(w) => match serde_json::to_string_pretty(&w) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("Erreur : {}", e);
+                    std::process::exit(1);
+                }
+            },
+            Err(e) => {
+                eprintln!("Erreur : {}", e);
+                std::process::exit(1);
+            }
         }
     };
 
-    match wallet::decrypt_wallet_file(&file, &pw) {
-        Ok(json) => println!("{}", json),
-        Err(e) => {
-            eprintln!("Erreur : {}", e);
-            std::process::exit(1);
-        }
-    }
+    println!("{}", json);
 }
 
-// ============================== RÉSEAU (lecture) ==============================
+// ============================== NETWORK (read) ==============================
 
+/// Handles the `balance` command.
 async fn handle_balance(args: &[String]) {
     let address = match get_flag_value(args, "--address") {
         Some(a) => a,
@@ -282,6 +317,7 @@ async fn handle_balance(args: &[String]) {
     }
 }
 
+/// Handles the `transactions`/`history` command.
 async fn handle_transactions(args: &[String]) {
     let address = match get_flag_value(args, "--address") {
         Some(a) => a,
@@ -306,6 +342,7 @@ async fn handle_transactions(args: &[String]) {
     }
 }
 
+/// Handles the `faucet` command (testnet only).
 async fn handle_faucet(args: &[String]) {
     let address = match get_flag_value(args, "--address") {
         Some(a) => a,
@@ -336,8 +373,10 @@ async fn handle_faucet(args: &[String]) {
     }
 }
 
-// ============================== ENVOI ==============================
+// ============================== SEND ==============================
 
+/// Handles the `send` command: decrypts (or loads) the wallet, then builds,
+/// signs, and submits the payment.
 async fn handle_send(args: &[String]) {
     let file = match get_flag_value(args, "-f").or_else(|| get_flag_value(args, "--file")) {
         Some(f) => f,
@@ -361,9 +400,9 @@ async fn handle_send(args: &[String]) {
             std::process::exit(1);
         }
     };
-    // Optionnel, mais si présent doit être un entier valide -- on préfère
-    // échouer bruyamment plutôt que d'ignorer silencieusement un tag mal
-    // formé (ce qui pourrait faire perdre les fonds chez le destinataire).
+    // Optional, but if present must be a valid integer -- we'd rather fail
+    // loudly than silently ignore a malformed tag (which could cause funds
+    // to be lost on the recipient's side).
     let destination_tag: Option<u32> = match get_flag_value(args, "--destination-tag") {
         Some(v) => match v.parse::<u32>() {
             Ok(t) => Some(t),
@@ -378,11 +417,11 @@ async fn handle_send(args: &[String]) {
 
     eprintln!("Chargement du wallet...");
 
-    // Le wallet déchiffré (avec sa clé privée) ne vit que dans cette fonction,
-    // le temps de signer et soumettre -- puis ce processus se termine.
-    // Un mot de passe n'est nécessaire (et utilisé) que si le fichier est
-    // effectivement chiffré (`*.encrypted.json`) -- un wallet sauvegardé en
-    // clair (`*.json`) peut être envoyé sans mot de passe.
+    // The decrypted wallet (with its private key) only lives for the
+    // duration of this function -- signing, submitting, then this process
+    // terminates. A password is only required (and used) if the file is
+    // actually encrypted (`*.encrypted.json`) -- a wallet saved in plain
+    // text (`*.json`) can be sent from without a password.
     let decrypted = if wallet::is_encrypted_file(&file) {
         let pw = match password {
             Some(p) if !p.is_empty() => p,
@@ -433,6 +472,7 @@ async fn handle_send(args: &[String]) {
     }
 }
 
+/// Prints CLI usage help to stderr.
 fn print_help() {
     eprintln!(
         r#"XRPL Wallet CLI
@@ -454,7 +494,8 @@ ENVOI (déchiffre le wallet le temps de cet appel uniquement) :
 
 DÉCHIFFREMENT :
   cli --address -f <FICHIER> [--password-stdin | -p <MOT_DE_PASSE>]   Affiche uniquement l'adresse/clé publique
-  cli --decrypt -f <FICHIER> (--password-stdin | -p <MOT_DE_PASSE>)   Affiche le wallet complet (clé privée incluse)
+  cli --decrypt -f <FICHIER> [--password-stdin | -p <MOT_DE_PASSE>]   Affiche le wallet complet (seed et clé privée inclus)
+  (le mot de passe n'est requis que si le fichier est chiffré, i.e. *.encrypted.json)
 
 OPTIONS COMMUNES :
   --network <testnet|mainnet>   Réseau XRPL à utiliser. Défaut : testnet (sécurité)

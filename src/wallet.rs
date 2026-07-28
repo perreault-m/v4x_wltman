@@ -1,3 +1,16 @@
+//! Wallet management for the V4X Wallet Manager.
+//!
+//! Covers XRPL wallet generation (including vanity address search),
+//! at-rest encryption (AES-256-GCM, PBKDF2-derived key), and reading/writing
+//! wallet files to disk. Key derivation itself is delegated to `xrpl_mithril`
+//! (see [`wallet_from_seed`]): this module only generates entropy, encodes it
+//! as a standard XRPL seed, and stores/encrypts the resulting wallet.
+//!
+//! Shared by both the `cli` and `gui` binaries.
+//!
+//! Author: Michael.P for V4X
+//! Date: 2026-07-22
+
 use aes_gcm::AeadCore;
 use aes_gcm::{
     aead::{Aead, KeyInit, OsRng},
@@ -10,48 +23,37 @@ use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::fs;
-use std::path::PathBuf;
+use directories::ProjectDirs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use xrpl_mithril::wallet::Wallet as MithrilWallet;
 
+/// An XRPL wallet, as stored on disk (encrypted or in plain text).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Wallet {
+    /// Classic XRPL address (e.g. `"rN7n7otQDd6FczFgLdSqtcsAUxDkw6fzRH"`).
     pub address: String,
-    /// Champs informatifs, non utilisés pour signer (voir plus bas) --
-    /// laissés vides : voir la note dans `wallet_from_seed`.
+    /// Informational only, currently unused (kept empty). Key derivation is
+    /// fully delegated to `xrpl_mithril`, which does not expose raw key
+    /// material to callers.
     pub public_key: String,
+    /// Informational only, currently unused (kept empty). See `public_key`.
     pub private_key: String,
-    /// Seed XRPL standard (Base58Check). C'est la SEULE donnée nécessaire
-    /// (et utilisée) pour signer -- voir `network.rs::send_payment`, qui
-    /// reconstruit toujours le wallet de signature à partir de ce champ via
+    /// The XRPL seed (Base58Check-encoded). This is the only field required
+    /// -- and used -- for signing: [`crate::network::send_payment`] always
+    /// reconstructs the signing wallet from this field via
     /// `xrpl_mithril::wallet::Wallet::from_seed_encoded`.
     #[serde(default)]
     pub seed: Option<String>,
 }
 
-/// Version byte XRPL pour un seed "famille" secp256k1 (un seul octet) --
-/// c'est le format "s..." classique.
-///
-/// NOTE IMPORTANTE : cette application utilisait auparavant l'algorithme
-/// Ed25519 (seeds "sEd..."), qui utilise un préfixe de version à 3 octets.
-/// Cette structure a été vérifiée correcte (comparée octet à octet à deux
-/// seeds Ed25519 réels et valides trouvés indépendamment), mais
-/// `xrpl_mithril::wallet::Wallet::from_seed_encoded` a rejeté un seed
-/// pourtant correctement structuré avec l'erreur "invalid version byte for
-/// seed" -- ce qui indique un bug dans le décodage des seeds Ed25519 de
-/// cette bibliothèque (son propre exemple de seed Ed25519 dans sa
-/// documentation a d'ailleurs un checksum invalide, signe qu'il n'a
-/// probablement jamais été généré/testé pour de vrai). On utilise donc ici
-/// secp256k1 -- le SEUL chemin vérifié fonctionner de bout en bout avec
-/// `xrpl_mithril` (génération ET `from_seed_encoded`), via son propre
-/// exemple de documentation.
+/// XRPL version byte for a secp256k1 "family seed" (single byte). This is
+/// the classic `"s..."` seed format.
 const SECP256K1_SEED_VERSION: u8 = 0x21;
 
-/// Encode 16 octets d'entropie en seed XRPL secp256k1 standard ("s...").
-/// `bs58::with_check_version` supporte nativement un octet de version unique
-/// (contrairement au cas Ed25519 à 3 octets), donc pas de construction
-/// manuelle du checksum nécessaire ici.
+/// Encodes 16 bytes of entropy into a standard XRPL secp256k1 seed
+/// (`"s..."`).
 fn encode_seed(entropy: &[u8; 16]) -> String {
     bs58::encode(entropy)
         .with_alphabet(bs58::Alphabet::RIPPLE)
@@ -59,18 +61,11 @@ fn encode_seed(entropy: &[u8; 16]) -> String {
         .into_string()
 }
 
-/// Construit notre `Wallet` (stockage/chiffrement/affichage) à partir d'un
-/// seed en le faisant passer par `xrpl_mithril::wallet::Wallet::from_seed_encoded`
-/// -- exactement le même appel que celui utilisé plus tard pour signer dans
-/// `network.rs::send_payment`. Comme c'est littéralement le même code qui
-/// dérive l'adresse ici et qui signera plus tard, l'adresse affichée est
-/// garantie par construction être celle qui signe réellement.
-///
-/// `public_key`/`private_key` sont laissés vides : la dérivation de clé est
-/// désormais entièrement déléguée à `xrpl_mithril`, qui n'expose pas (à
-/// notre connaissance actuelle de son API) d'accesseur pour récupérer ces
-/// octets bruts. Ils ne sont de toute façon jamais utilisés pour signer --
-/// uniquement `seed` l'est.
+/// Builds a [`Wallet`] from a seed, via `xrpl_mithril::wallet::Wallet::from_seed_encoded`
+/// -- the exact same call used later for signing in
+/// [`crate::network::send_payment`]. Because address derivation here and
+/// signing later both go through the same library call, the displayed
+/// address is guaranteed to match the account that actually signs.
 fn wallet_from_seed(seed: &str) -> Result<Wallet, String> {
     let mw = MithrilWallet::from_seed_encoded(seed)
         .map_err(|e| format!("Erreur de reconstruction du wallet (xrpl_mithril) : {:?}", e))?;
@@ -83,20 +78,21 @@ fn wallet_from_seed(seed: &str) -> Result<Wallet, String> {
     })
 }
 
-/// Génère un wallet XRPL aléatoire (secp256k1). L'entropie est générée
-/// localement (CSPRNG), encodée en seed standard, puis immédiatement
-/// validée/reconstruite via `xrpl_mithril` -- qui fait toute la dérivation
-/// cryptographique réelle (clé, adresse).
+/// Generates a new random XRPL wallet (secp256k1). Entropy is generated
+/// locally with a CSPRNG, encoded as a standard seed, then immediately
+/// reconstructed through `xrpl_mithril`, which performs the actual
+/// cryptographic derivation (key, address).
 pub fn generate_random_wallet() -> Result<Wallet, String> {
     let mut entropy = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut entropy);
     wallet_from_seed(&encode_seed(&entropy))
 }
 
-/// Recherche un wallet vanity (secp256k1) via `xrpl_mithril`.
+/// Searches for a vanity wallet whose address starts with one of the given
+/// prefixes.
 ///
-/// Retourne `Ok(None)` si la recherche a été annulée, `Err(_)` en cas
-/// d'erreur de reconstruction, `Ok(Some(wallet))` en cas de succès.
+/// Returns `Ok(None)` if the search was cancelled, `Err(_)` on a
+/// reconstruction error, `Ok(Some(wallet))` on success.
 pub fn generate_vanity_wallet(
     prefixes: &[String],
     attempts_counter: Option<Arc<AtomicU64>>,
@@ -122,9 +118,9 @@ pub fn generate_vanity_wallet(
 
         let mw = match MithrilWallet::from_seed_encoded(&seed) {
             Ok(w) => w,
-            // Ne devrait quasiment jamais arriver pour un seed qu'on vient
-            // de générer nous-mêmes correctement formé -- on retente plutôt
-            // que d'interrompre toute la recherche pour un cas limite.
+            // Should essentially never happen for a seed we just generated
+            // ourselves in the correct format -- retry rather than aborting
+            // the whole search over an edge case.
             Err(_) => continue,
         };
         let address_upper = mw.account_id().to_classic_address().to_uppercase();
@@ -135,9 +131,11 @@ pub fn generate_vanity_wallet(
     }
 }
 
-
-// ==================== Le reste du fichier reste inchangé ====================
-
+/// Returns the directory the current executable lives in (falls back to the
+/// current directory if it cannot be determined). Used only as a last-resort
+/// fallback for [`wallets_dir`], and to locate wallets from versions of this
+/// app that predate the move to a persistent, per-user data directory (see
+/// [`migrate_legacy_wallets`]).
 fn exe_dir() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -145,22 +143,100 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Returns the OS-appropriate, per-user persistent data directory for this
+/// app (outside of and independent from wherever the executable happens to
+/// be installed), e.g.:
+/// - Windows: `C:\Users\<user>\AppData\Local\V4X\V4X Wallet Manager\data`
+/// - Linux:   `~/.local/share/v4x-wallet-manager`
+/// - macOS:   `~/Library/Application Support/com.V4X.V4X-Wallet-Manager`
+///
+/// Falls back to [`exe_dir`] if the OS's home/user directories cannot be
+/// determined (rare, e.g. some minimal/sandboxed environments).
+fn persistent_data_dir() -> PathBuf {
+    ProjectDirs::from("com", "V4X", "V4X Wallet Manager")
+        .map(|proj_dirs| proj_dirs.data_local_dir().to_path_buf())
+        .unwrap_or_else(exe_dir)
+}
+
 const PLAIN_SUFFIX: &str = ".json";
 const ENCRYPTED_SUFFIX: &str = ".encrypted.json";
 
-/// Indique, d'après son nom de fichier, si un wallet est stocké chiffré
-/// (`*.encrypted.json`) ou en clair (`*.json`). Permet à l'appelant de savoir
-/// si un mot de passe est nécessaire avant de tenter de le charger.
+/// Returns whether a wallet file is encrypted (`*.encrypted.json`) or in
+/// plain text (`*.json`), based on its filename. Lets the caller know
+/// whether a password is required before attempting to load it.
 pub fn is_encrypted_file(path: &str) -> bool {
     path.ends_with(ENCRYPTED_SUFFIX)
 }
 
+/// Returns the `wallets/` directory in the app's persistent per-user data
+/// directory, creating it if necessary. This intentionally does NOT live
+/// next to the executable: installing an update (which typically replaces
+/// or reinstalls the executable's directory) must never be able to wipe out
+/// a user's wallets.
+///
+/// On first use after upgrading from a version of this app that stored
+/// wallets next to the executable, any wallet files found there are
+/// automatically copied (not moved) into the new location -- see
+/// [`migrate_legacy_wallets`].
 pub fn wallets_dir() -> PathBuf {
-    let dir = exe_dir().join("wallets");
+    let dir = persistent_data_dir().join("wallets");
     let _ = fs::create_dir_all(&dir);
+    migrate_legacy_wallets(&dir);
     dir
 }
 
+/// One-time, non-destructive migration: copies any wallet files found next
+/// to the executable (the old storage location, used by versions of this
+/// app prior to the move to a persistent per-user directory) into the new
+/// persistent `wallets_dir`, skipping any file that already exists at the
+/// destination. The original files are left in place (copied, never
+/// moved/deleted), so this is always safe to run and safe to run repeatedly.
+fn migrate_legacy_wallets(new_dir: &Path) {
+    let legacy_dir = exe_dir().join("wallets");
+    if legacy_dir == *new_dir {
+        // `persistent_data_dir` fell back to `exe_dir` (e.g. OS user
+        // directories unavailable) -- old and new locations are the same,
+        // nothing to migrate.
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(&legacy_dir) else {
+        return; // no legacy directory (fresh install, or already fully on Linux/etc.)
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !file_name.ends_with(ENCRYPTED_SUFFIX) && !file_name.ends_with(PLAIN_SUFFIX) {
+            continue;
+        }
+
+        let dest = new_dir.join(file_name);
+        if dest.exists() {
+            continue; // already migrated (or a wallet of the same name was created at the new location)
+        }
+
+        match fs::copy(&path, &dest) {
+            Ok(_) => eprintln!(
+                "Migration : wallet \"{}\" copié vers le nouvel emplacement persistant.",
+                file_name
+            ),
+            Err(e) => eprintln!(
+                "Migration : échec de la copie de \"{}\" ({}).",
+                file_name, e
+            ),
+        }
+    }
+}
+
+/// Sanitizes a user-supplied wallet name into a safe filename component
+/// (alphanumeric, `-`, and `_` only). Falls back to `"wallet"` if the result
+/// would be empty. This also prevents path traversal via the wallet name.
 pub fn sanitize_wallet_name(name: &str) -> String {
     let cleaned: String = name
         .trim()
@@ -174,13 +250,18 @@ pub fn sanitize_wallet_name(name: &str) -> String {
     }
 }
 
+/// A wallet file found on disk, as listed by [`list_wallets`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletFile {
+    /// Wallet name (filename without its `.json`/`.encrypted.json` suffix).
     pub name: String,
+    /// Full path to the file.
     pub path: PathBuf,
+    /// Whether the file is encrypted.
     pub encrypted: bool,
 }
 
+/// Lists all wallet files found in [`wallets_dir`], sorted by name.
 pub fn list_wallets() -> Vec<WalletFile> {
     let dir = wallets_dir();
     let mut result = Vec::new();
@@ -215,6 +296,7 @@ pub fn list_wallets() -> Vec<WalletFile> {
     result
 }
 
+/// Saves a wallet to disk in plain text (unencrypted JSON).
 pub fn save_wallet(wallet: &Wallet, name: &str) -> Result<PathBuf, String> {
     let json = serde_json::to_string_pretty(wallet).map_err(|e| e.to_string())?;
     let path = wallets_dir().join(format!("{}{PLAIN_SUFFIX}", sanitize_wallet_name(name)));
@@ -222,6 +304,8 @@ pub fn save_wallet(wallet: &Wallet, name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Encrypts a wallet with a password (AES-256-GCM, PBKDF2-HMAC-SHA256 key
+/// derivation) and saves it to disk.
 pub fn encrypt_and_save(wallet: &Wallet, name: &str, password: &str) -> Result<PathBuf, String> {
     let json_bytes = serde_json::to_vec_pretty(wallet).map_err(|e| e.to_string())?;
 
@@ -255,11 +339,13 @@ pub fn encrypt_and_save(wallet: &Wallet, name: &str, password: &str) -> Result<P
     Ok(path)
 }
 
+/// Loads a plain-text (unencrypted) wallet file from disk.
 pub fn load_plain_wallet(path: &str) -> Result<Wallet, String> {
     let bytes = fs::read(path).map_err(|e| format!("Impossible de lire le fichier : {}", e))?;
     serde_json::from_slice(&bytes).map_err(|_| "JSON invalide".to_string())
 }
 
+/// Decrypts an encrypted wallet file and returns its raw JSON content.
 pub fn decrypt_wallet_file(path: &str, password: &str) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| format!("Impossible de lire le fichier : {}", e))?;
     let data: serde_json::Value =
@@ -290,11 +376,14 @@ pub fn decrypt_wallet_file(path: &str, password: &str) -> Result<String, String>
         .map_err(|_| "UTF-8 invalide dans les données déchiffrées".to_string())
 }
 
+/// Decrypts an encrypted wallet file and deserializes it into a [`Wallet`].
 pub fn decrypt_wallet(path: &str, password: &str) -> Result<Wallet, String> {
     let json = decrypt_wallet_file(path, password)?;
     serde_json::from_str(&json).map_err(|e| format!("JSON invalide après déchiffrement : {}", e))
 }
 
+/// Parses a comma-separated list of vanity address prefixes into a
+/// normalized (trimmed, uppercased) list.
 pub fn parse_prefixes(input: &str) -> Vec<String> {
     input
         .split(',')

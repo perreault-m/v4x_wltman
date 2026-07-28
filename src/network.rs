@@ -1,21 +1,28 @@
-// Couche réseau XRPL : JSON-RPC en lecture (balance, transactions) maison via
-// reqwest, et envoi de paiement via `xrpl-mithril` (construction, autofill,
-// signature Ed25519 et soumission).
-//
-// N'est inclus QUE par le binaire CLI (#[path] depuis src/bin/cli.rs) : la GUI
-// ne dépend jamais directement du réseau ni des clés privées pour ces opérations.
+//! XRPL network layer for the V4X Wallet Manager.
+//!
+//! Provides read access (balance, transaction history) via a small
+//! hand-rolled JSON-RPC client built on `reqwest`, and payment submission via
+//! `xrpl-mithril` (transaction building, autofill, signing, and submission).
+//!
+//! Only included by the `cli` binary (via `#[path]` from `src/bin/cli.rs`):
+//! the GUI never depends on the network or on private key material directly
+//! for these operations -- it always shells out to the `cli` binary.
+//!
+//! Author: Michael.P for V4X
+//! Date: 2026-07-22
 
 use crate::wallet::Wallet;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-/// Délai maximal accordé à un appel réseau (lecture JSON-RPC, faucet, ou
-/// étape de la construction/soumission d'un paiement) avant d'abandonner
-/// avec une erreur explicite plutôt que de rester bloqué indéfiniment si le
-/// serveur XRPL est lent, injoignable, ou ne répond jamais.
+/// Maximum time allowed for a single network call (JSON-RPC read, faucet
+/// request, or a step of building/submitting a payment) before giving up
+/// with an explicit error, rather than hanging indefinitely if the XRPL
+/// server is slow, unreachable, or never responds.
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Which XRPL network to talk to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
     Testnet,
@@ -23,7 +30,8 @@ pub enum Network {
 }
 
 impl Network {
-    /// Parse "testnet"/"mainnet" (insensible à la casse). `None` si invalide.
+    /// Parses `"testnet"`/`"mainnet"` (case-insensitive). Returns `None` if
+    /// the value is not recognized.
     pub fn parse(s: &str) -> Option<Network> {
         match s.to_lowercase().as_str() {
             "testnet" | "test" => Some(Network::Testnet),
@@ -32,17 +40,18 @@ impl Network {
         }
     }
 
-    /// Liste ordonnée de serveurs RPC publics à essayer pour ce réseau.
-    /// Sur mainnet, plusieurs clusters publics officiels existent -- si le
-    /// premier est "amendment blocked" (en retard sur des amendements déjà
-    /// activés par le réseau, donc incapable de traiter AUCUNE transaction,
-    /// quelle que soit sa validité) ou simplement injoignable, on essaie le
-    /// suivant plutôt que d'échouer directement sur un seul point de
-    /// défaillance. Les trois sont des clusters publics officiels listés sur
-    /// https://xrpl.org/docs/tutorials/public-servers.
+    /// Ordered list of public RPC servers to try for this network.
+    ///
+    /// Mainnet has several official public clusters available: if the first
+    /// one is "amendment blocked" (behind on amendments the rest of the
+    /// network has already activated, and therefore unable to process ANY
+    /// transaction regardless of its validity) or simply unreachable, the
+    /// next candidate is tried instead of failing on a single point of
+    /// failure. All three are official public clusters listed at
+    /// <https://xrpl.org/docs/tutorials/public-servers>.
     fn rpc_candidates(&self) -> &'static [&'static str] {
         match self {
-            // Serveur public officiel du Testnet XRPL.
+            // Official public XRPL Testnet server.
             Network::Testnet => &["https://s.altnet.rippletest.net:51234/"],
             Network::Mainnet => &[
                 "https://xrplcluster.com/",
@@ -52,8 +61,8 @@ impl Network {
         }
     }
 
-    /// URL du faucet public (fournit des XRP de test gratuits). `None` sur
-    /// mainnet : aucun faucet n'existe pour de l'XRP réel.
+    /// Public faucet URL (provides free test XRP). `None` on mainnet: no
+    /// faucet exists for real XRP.
     fn faucet_url(&self) -> Option<&'static str> {
         match self {
             Network::Testnet => Some("https://faucet.altnet.rippletest.net/accounts"),
@@ -61,6 +70,7 @@ impl Network {
         }
     }
 
+    /// Short, human-readable network label (`"testnet"`/`"mainnet"`).
     pub fn label(&self) -> &'static str {
         match self {
             Network::Testnet => "testnet",
@@ -69,6 +79,7 @@ impl Network {
     }
 }
 
+/// Performs a single JSON-RPC call against one specific server.
 async fn rpc_call_at(rpc_url: &str, method: &str, params: Value) -> Result<Value, String> {
     let client = reqwest::Client::new();
     let body = json!({ "method": method, "params": [params] });
@@ -102,10 +113,14 @@ async fn rpc_call_at(rpc_url: &str, method: &str, params: Value) -> Result<Value
     Ok(result)
 }
 
-/// Un échec est considéré comme un problème DE SERVEUR (justifiant d'essayer
-/// le candidat suivant) plutôt qu'une réponse légitime du protocole (comme
-/// `actNotFound` pour un compte qui n'existe vraiment pas -- ça, tout noeud
-/// honnête répondrait pareil, donc inutile/trompeur de réessayer ailleurs).
+/// Returns whether an error looks like a SERVER-side health problem
+/// (justifying a retry against the next candidate) rather than a legitimate
+/// protocol response, such as `actNotFound` for an account that genuinely
+/// doesn't exist -- any honest node would return the same answer for that,
+/// so retrying elsewhere would be pointless and misleading.
+///
+/// Note: matches against the (French) error text produced by [`rpc_call_at`],
+/// since that's the only signal available here.
 fn is_server_health_issue(err: &str) -> bool {
     err.contains("amendmentBlocked")
         || err.starts_with("Erreur réseau")
@@ -113,6 +128,8 @@ fn is_server_health_issue(err: &str) -> bool {
         || err.contains("Champ 'result' manquant")
 }
 
+/// Performs a JSON-RPC call, trying each of the network's candidate servers
+/// in order until one succeeds or a non-server-health error is returned.
 async fn rpc_call(network: Network, method: &str, params: Value) -> Result<Value, String> {
     let candidates = network.rpc_candidates();
     let mut last_err = String::new();
@@ -126,7 +143,7 @@ async fn rpc_call(network: Network, method: &str, params: Value) -> Result<Value
                 if is_last || !is_server_health_issue(&e) {
                     return Err(last_err);
                 }
-                // Sinon : problème de serveur détecté, on essaie le candidat suivant.
+                // Otherwise: server-health issue detected, try the next candidate.
             }
         }
     }
@@ -134,13 +151,13 @@ async fn rpc_call(network: Network, method: &str, params: Value) -> Result<Value
     Err(last_err)
 }
 
-/// Vérifie qu'un serveur XRPL donné n'est pas "amendment blocked" -- c-à-d
-/// en retard sur des amendements déjà activés par le reste du réseau, auquel
-/// cas il refuse TOUTE soumission de transaction indépendamment de sa
-/// validité (voir https://xrpl.org/docs/infrastructure/troubleshooting/server-is-amendment-blocked).
-/// Utilisé comme vérification préalable avant de construire/signer/soumettre
-/// un paiement, pour donner une erreur claire immédiatement plutôt qu'un
-/// échec confus en plein milieu de la soumission via `xrpl_mithril`.
+/// Checks that a given XRPL server is not "amendment blocked" -- i.e. behind
+/// on amendments already activated by the rest of the network, in which case
+/// it refuses ANY transaction submission regardless of validity (see
+/// <https://xrpl.org/docs/infrastructure/troubleshooting/server-is-amendment-blocked>).
+/// Used as a pre-flight check before building/signing/submitting a payment,
+/// to surface a clear error immediately rather than a confusing failure from
+/// deep inside `xrpl_mithril`.
 async fn check_server_health(rpc_url: &str) -> Result<(), String> {
     let result = rpc_call_at(rpc_url, "server_info", json!({})).await?;
 
@@ -157,9 +174,9 @@ async fn check_server_health(rpc_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Choisit le premier serveur RPC sain parmi les candidats du réseau donné.
-/// Sur mainnet notamment, s'il y en a plusieurs et que le premier est
-/// bloqué/injoignable, essaie les suivants avant d'abandonner.
+/// Picks the first healthy RPC server among the given network's candidates.
+/// On mainnet in particular, if there are several and the first is
+/// blocked/unreachable, the next ones are tried before giving up.
 async fn pick_healthy_rpc_url(network: Network) -> Result<&'static str, String> {
     let candidates = network.rpc_candidates();
     let mut last_err = String::new();
@@ -178,9 +195,9 @@ async fn pick_healthy_rpc_url(network: Network) -> Result<&'static str, String> 
     ))
 }
 
-/// Convertit un montant en drops (chaîne, ex: "999999999960") en chaîne XRP
-/// lisible ("999999.999960"), avec arithmétique entière (pas de float, pour éviter
-/// toute perte de précision sur un montant financier).
+/// Converts an amount in drops (string, e.g. `"999999999960"`) into a
+/// human-readable XRP string (`"999999.999960"`), using integer arithmetic
+/// (no floats) to avoid any precision loss on a financial amount.
 fn drops_to_xrp_string(drops: &str) -> String {
     let value: i128 = drops.parse().unwrap_or(0);
     let whole = value / 1_000_000;
@@ -188,8 +205,9 @@ fn drops_to_xrp_string(drops: &str) -> String {
     format!("{}.{:06}", whole, frac)
 }
 
-/// Convertit un montant XRP saisi par l'utilisateur (ex: "1.5") en drops (u64).
-/// Rejette tout ce qui n'est pas un nombre positif avec au plus 6 décimales.
+/// Converts a user-entered XRP amount (e.g. `"1.5"`) into drops (`u64`).
+/// Rejects anything that isn't a positive number with at most 6 decimal
+/// places.
 pub fn xrp_to_drops(xrp: &str) -> Result<u64, String> {
     let trimmed = xrp.trim();
     if trimmed.is_empty() {
@@ -217,8 +235,9 @@ pub fn xrp_to_drops(xrp: &str) -> Result<u64, String> {
     u64::try_from(drops).map_err(|_| "Montant XRP trop élevé.".to_string())
 }
 
+/// Converts an XRPL "Ripple time" timestamp into a human-readable UTC string.
 fn ripple_time_to_readable(ripple_time: u64) -> String {
-    // L'époque Ripple commence le 2000-01-01T00:00:00Z, soit 946684800s après l'époque Unix.
+    // The Ripple epoch starts 2000-01-01T00:00:00Z, i.e. 946684800s after the Unix epoch.
     let unix_time = ripple_time as i64 + 946_684_800;
     match chrono::DateTime::from_timestamp(unix_time, 0) {
         Some(dt) => dt.format("%Y-%m-%d %H:%M UTC").to_string(),
@@ -226,16 +245,18 @@ fn ripple_time_to_readable(ripple_time: u64) -> String {
     }
 }
 
+/// Account balance information for a given address/network.
 #[derive(Debug, Serialize)]
 pub struct Balance {
     pub address: String,
     pub network: String,
+    /// Whether the account exists on the ledger (has ever received XRP).
     pub activated: bool,
     pub xrp_balance: String,
     pub drops: String,
 }
 
-/// Récupère la balance d'une adresse. Ne nécessite QUE l'adresse publique.
+/// Fetches the balance of an address. Requires ONLY the public address.
 pub async fn fetch_balance(address: &str, network: Network) -> Result<Balance, String> {
     let params = json!({ "account": address, "ledger_index": "validated" });
 
@@ -258,7 +279,7 @@ pub async fn fetch_balance(address: &str, network: Network) -> Result<Balance, S
                 drops,
             })
         }
-        // Compte jamais activé (0 XRP reçu) : pas une erreur, juste un solde nul.
+        // Account never activated (0 XRP received): not an error, just a zero balance.
         Err(e) if e.contains("actNotFound") => Ok(Balance {
             address: address.to_string(),
             network: network.label().to_string(),
@@ -270,9 +291,9 @@ pub async fn fetch_balance(address: &str, network: Network) -> Result<Balance, S
     }
 }
 
-/// Demande des XRP de test au faucet public. N'existe que sur testnet -- retourne
-/// une erreur explicite si appelée sur mainnet (il n'y a pas de faucet pour de
-/// l'XRP réel).
+/// Requests free test XRP from the public faucet. Only exists on testnet --
+/// returns an explicit error if called on mainnet (there is no faucet for
+/// real XRP).
 pub async fn fund_via_faucet(address: &str, network: Network) -> Result<(), String> {
     let url = network
         .faucet_url()
@@ -300,6 +321,7 @@ pub async fn fund_via_faucet(address: &str, network: Network) -> Result<(), Stri
     }
 }
 
+/// Summary of a single transaction, as returned by [`fetch_transactions`].
 #[derive(Debug, Serialize)]
 pub struct TxSummary {
     pub hash: String,
@@ -312,7 +334,8 @@ pub struct TxSummary {
     pub successful: bool,
 }
 
-/// Récupère les dernières transactions d'une adresse. Ne nécessite QUE l'adresse publique.
+/// Fetches the most recent transactions for an address. Requires ONLY the
+/// public address.
 pub async fn fetch_transactions(
     address: &str,
     network: Network,
@@ -340,8 +363,8 @@ pub async fn fetch_transactions(
 
     let mut out = Vec::new();
     for entry in entries {
-        // Selon la version d'API, les champs de la transaction sont soit sous "tx",
-        // soit sous "tx_json", soit directement à la racine de l'entrée.
+        // Depending on the API version, transaction fields live under "tx",
+        // under "tx_json", or directly at the entry's root.
         let tx = entry
             .get("tx")
             .or_else(|| entry.get("tx_json"))
@@ -365,8 +388,8 @@ pub async fn fetch_transactions(
         let to = tx.get("Destination").and_then(|a| a.as_str()).map(str::to_string);
         let destination_tag = tx.get("DestinationTag").and_then(|t| t.as_u64());
 
-        // Seuls les montants en XRP natif (chaîne de drops) sont affichés simplement ;
-        // les montants en devise émise (objets) ne sont pas traités ici.
+        // Only native XRP amounts (drops strings) are displayed as-is;
+        // issued-currency amounts (objects) are not handled here.
         let amount_xrp = tx
             .get("Amount")
             .and_then(|a| a.as_str())
@@ -398,21 +421,17 @@ pub async fn fetch_transactions(
     Ok(out)
 }
 
-/// Construit, signe et soumet un paiement XRP. Nécessite le `Wallet` complet
-/// (donc la clé privée) le temps de cette seule fonction — appelant·e a la
-/// responsabilité de ne le déchiffrer que juste avant cet appel et de le
-/// laisser sortir de portée immédiatement après (voir `cli.rs`, commande `send`,
-/// qui tourne dans un processus dédié qui se termine juste après).
-/// Construit, signe et soumet un paiement XRP via `xrpl-mithril` (API haut
-/// niveau : autofill du Fee/Sequence/LastLedgerSequence, signature Ed25519,
-/// soumission + attente de validation). Nécessite que le `Wallet` ait une
-/// `seed` XRPL valide -- les wallets créés avant l'ajout de ce champ ne
-/// peuvent plus signer de transaction (voir doc du champ `Wallet::seed`).
+/// Builds, signs, and submits an XRP payment via `xrpl-mithril` (high-level
+/// API: autofills Fee/Sequence/LastLedgerSequence, signs the transaction,
+/// submits it, and waits for validation).
 ///
-/// L'appelant a la responsabilité de ne déchiffrer le wallet que juste avant
-/// cet appel et de le laisser sortir de portée immédiatement après (voir
-/// `cli.rs`, commande `send`, qui tourne dans un processus dédié qui se
-/// termine juste après).
+/// Requires the `Wallet` to have a valid XRPL `seed` -- see the
+/// [`Wallet::seed`](crate::wallet::Wallet::seed) field's documentation.
+///
+/// The caller is responsible for only decrypting the wallet right before
+/// this call and letting it go out of scope immediately afterwards (see
+/// `cli.rs`'s `send` command, which runs in a dedicated process that
+/// terminates right after).
 pub async fn send_payment(
     wallet: &Wallet,
     destination: &str,
@@ -455,25 +474,25 @@ pub async fn send_payment(
         .build()
         .map_err(|e| format!("Erreur construction tx : {:?}", e))?;
 
-    // Choisit un serveur RPC sain (pas "amendment blocked") parmi les
-    // candidats connus pour ce réseau -- voir `pick_healthy_rpc_url`. Donne
-    // une erreur claire immédiatement si aucun n'est disponible, plutôt
-    // qu'un échec confus renvoyé depuis le milieu de `xrpl_mithril`.
+    // Pick a healthy server (not "amendment blocked") among this network's
+    // candidates -- see `pick_healthy_rpc_url`. Fails with a clear error
+    // immediately if none are available, rather than a confusing failure
+    // surfaced from the middle of `xrpl_mithril`.
     let rpc_url = pick_healthy_rpc_url(network).await?;
 
     let client = JsonRpcClient::new(rpc_url)
         .map_err(|e| format!("Erreur connexion : {:?}", e))?;
 
-    // `autofill` interroge l'état du compte ÉMETTEUR (Sequence, Fee,
-    // LastLedgerSequence) -- PAS celui du destinataire. Un destinataire non
-    // activé est un cas parfaitement normal pour un Payment (c'est justement
-    // ce qui l'active) et ne fait pas échouer `autofill`. Si `autofill`
-    // échoue, c'est donc que le compte ÉMETTEUR lui-même pose problème (non
-    // activé, réseau injoignable, etc.) -- continuer quand même produirait
-    // une transaction avec des champs incomplets (Sequence/Fee/
-    // LastLedgerSequence), qui risque d'être rejetée silencieusement ou de
-    // rester bloquée indéfiniment dans `submit_and_wait` sans jamais être
-    // validée. On traite donc toute erreur ici comme fatale.
+    // `autofill` queries the SENDER account's state (Sequence, Fee,
+    // LastLedgerSequence) -- NOT the destination's. An unactivated
+    // destination is a perfectly normal case for a Payment (that's exactly
+    // what activates it) and does not make `autofill` fail. If `autofill`
+    // fails, it's therefore the SENDER account itself that has a problem
+    // (not activated, network unreachable, etc.) -- continuing anyway would
+    // produce a transaction with incomplete fields (Sequence/Fee/
+    // LastLedgerSequence), which risks being silently rejected or left
+    // hanging indefinitely in `submit_and_wait` without ever being
+    // validated. Any error here is therefore treated as fatal.
     tokio::time::timeout(NETWORK_TIMEOUT, autofill(&client, &mut unsigned))
         .await
         .map_err(|_| "Délai dépassé lors de la préparation de la transaction (serveur XRPL injoignable ou trop lent).".to_string())?
