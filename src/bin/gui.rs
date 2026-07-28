@@ -57,8 +57,8 @@ const V4X_PREFIX: &str = "RV4X";
 // really controlled by you, independently of this binary.
 //
 // TODO: replace these with your real XRPL addresses before shipping.
-const CREATOR_DONATION_ADDRESS: &str = "rREPLACE_WITH_CREATOR_ADDRESS00000";
-const DEV_DONATION_ADDRESS: &str = "rREPLACE_WITH_DEV_ADDRESS000000000";
+const CREATOR_DONATION_ADDRESS: &str = "rB1KuyGCVCbU1KSkAtWmc7giWhu1b3stbp";
+const DEV_DONATION_ADDRESS: &str = "rV4XMzMfq9fjfrf6kzdYjWZM8xjSdtsZR";
 
 fn main() -> iced::Result {
     iced::application(MyApp::title, MyApp::update, MyApp::view)
