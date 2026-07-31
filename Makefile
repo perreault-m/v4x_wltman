@@ -19,6 +19,26 @@ ICON_DEST      = $(ICON_THEME_DIR)/$(DESKTOP_ID).png
 # .desktop stays next to the binary (or you can put it in applications/)
 DESKTOP_FILE   = $(RELEASE_DIR)/$(DESKTOP_ID).desktop
 
+# Windows cross-compilation target.
+# One-time setup on the build machine before `make windows` will work:
+#   rustup target add x86_64-pc-windows-gnu
+#   apt install mingw-w64        # (Debian/Ubuntu -- provides the MinGW linker)
+WINDOWS_TARGET      = x86_64-pc-windows-gnu
+WINDOWS_RELEASE_DIR = target/$(WINDOWS_TARGET)/release
+WINDOWS_BIN         = $(WINDOWS_RELEASE_DIR)/$(BINARY_NAME).exe
+
+# Release archives, written at the Makefile's location (project root).
+ZIP_LINUX      = $(CURDIR)/linux.zip
+ZIP_WINDOWS    = $(CURDIR)/windows.zip
+
+# ============================================================
+# Default: build both platforms
+# ============================================================
+.PHONY: all linux windows
+.DEFAULT_GOAL := all
+
+all: linux windows
+
 # ============================================================
 # Linux target
 # ============================================================
@@ -45,3 +65,33 @@ linux: $(RELEASE_BIN)
 
 $(RELEASE_BIN):
 	cargo build --release
+
+# ============================================================
+# Windows target (cross-compiled via MinGW)
+# ============================================================
+windows: $(WINDOWS_BIN)
+	@echo "✓ Done!"
+	@echo "  Windows binaries in: $(WINDOWS_RELEASE_DIR)/"
+
+$(WINDOWS_BIN):
+	cargo build --release --target $(WINDOWS_TARGET)
+
+# ============================================================
+# Zip archives (optional -- not built by `make`/`all` by default).
+# Each depends on its build target, so `make zip-linux`/`zip-windows`
+# will build first if needed.
+# ============================================================
+.PHONY: zip zip-linux zip-windows
+zip: zip-linux zip-windows
+
+zip-linux: linux
+	@echo "→ Zipping $(RELEASE_DIR) into $(ZIP_LINUX)..."
+	@rm -f $(ZIP_LINUX)
+	@cd $(RELEASE_DIR) && zip -r -q $(ZIP_LINUX) .
+	@echo "✓ Archive: $(ZIP_LINUX)"
+
+zip-windows: windows
+	@echo "→ Zipping $(WINDOWS_RELEASE_DIR) into $(ZIP_WINDOWS)..."
+	@rm -f $(ZIP_WINDOWS)
+	@cd $(WINDOWS_RELEASE_DIR) && zip -r -q $(ZIP_WINDOWS) .
+	@echo "✓ Archive: $(ZIP_WINDOWS)"
