@@ -13,6 +13,8 @@
 
 #[path = "../wallet.rs"]
 mod wallet;
+#[path = "../i18n.rs"]
+mod i18n;
 
 use iced::widget::{
     button, center, checkbox, column, container, mouse_area, opaque, pick_list, qr_code, row,
@@ -25,6 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use i18n::{t, t_args, Lang};
 use wallet::{Wallet, WalletFile};
 
 // --- "V4X" palette: technological green on a very dark background ---
@@ -212,6 +215,7 @@ struct TxInfo {
 struct MyApp {
     modal: Modal,
     network: NetworkChoice,
+    lang: Lang,
 
     // --- creation ---
     wallet_name_input: String,
@@ -314,6 +318,7 @@ enum Message {
     CloseModal,
 
     NetworkChanged(NetworkChoice),
+    LanguageChanged(Lang),
 
     WalletNameChanged(String),
     V4xAddressToggled(bool),
@@ -460,13 +465,13 @@ impl MyApp {
         {
             Some(w) => w.clone(),
             None => {
-                self.copy_seed_error = Some("Aucun wallet sélectionné.".into());
+                self.copy_seed_error = Some(t(self.lang, "wallet.select_required"));
                 return Task::none();
             }
         };
 
         if wallet.encrypted && self.copy_seed_password.is_empty() {
-            self.copy_seed_error = Some("Mot de passe manquant.".into());
+            self.copy_seed_error = Some(t(self.lang, "wallet.password_required"));
             return Task::none();
         }
 
@@ -585,6 +590,7 @@ impl MyApp {
                     return self.trigger_refresh();
                 }
             }
+            Message::LanguageChanged(lang) => self.lang = lang,
 
             Message::WalletNameChanged(s) => self.wallet_name_input = s,
             Message::V4xAddressToggled(v) => self.use_v4x_address = v,
@@ -598,7 +604,7 @@ impl MyApp {
 
                 let name = self.wallet_name_input.trim().to_string();
                 if name.is_empty() {
-                    self.create_error = Some("Veuillez entrer un nom pour le wallet.".into());
+                    self.create_error = Some(t(self.lang, "create.name_required"));
                     return Task::none();
                 }
 
@@ -606,7 +612,7 @@ impl MyApp {
                 // confirmation that they typed the password they meant to,
                 // since it's masked as they type.
                 if self.use_encryption && self.password_input != self.password_confirm_input {
-                    self.create_error = Some("Les mots de passe ne correspondent pas.".into());
+                    self.create_error = Some(t(self.lang, "create.password_mismatch"));
                     return Task::none();
                 }
 
@@ -682,7 +688,7 @@ impl MyApp {
                                 self.unlocked_wallets.sort_by(|a, b| a.name.cmp(&b.name));
                                 self.selected_unlocked = Some(name.clone());
                                 self.create_success =
-                                    Some(format!("Wallet V4X « {} » créé avec succès.", name));
+                                    Some(t_args(self.lang, "create.success", &[("name", &name)]));
                                 drop(slot);
                                 return self.trigger_refresh();
                             }
@@ -816,7 +822,7 @@ impl MyApp {
                 {
                     Some(w) => w.address.clone(),
                     None => {
-                        self.faucet_error = Some("Aucun wallet sélectionné.".into());
+                        self.faucet_error = Some(t(self.lang, "wallet.select_required"));
                         return Task::none();
                     }
                 };
@@ -848,9 +854,7 @@ impl MyApp {
                         self.faucet_requesting = false;
                         match outcome {
                             Ok(()) => {
-                                self.faucet_message = Some(
-                                    "Requête acceptée. Rafraîchissez dans quelques secondes pour voir le solde.".to_string(),
-                                );
+                                self.faucet_message = Some(t(self.lang, "faucet.success"));
                                 drop(slot);
                                 return self.trigger_refresh();
                             }
@@ -882,31 +886,28 @@ impl MyApp {
                 {
                     Some(w) => w.encrypted,
                     None => {
-                        self.send_error = Some("Aucun wallet sélectionné.".into());
+                        self.send_error = Some(t(self.lang, "wallet.select_required"));
                         return Task::none();
                     }
                 };
                 if !looks_like_xrpl_address(&self.send_destination) {
-                    self.send_error =
-                        Some("Adresse destinataire invalide (doit commencer par 'r').".into());
+                    self.send_error = Some(t(self.lang, "send.address_invalid"));
                     return Task::none();
                 }
                 if !looks_like_xrp_amount(&self.send_amount) {
-                    self.send_error =
-                        Some("Montant XRP invalide (nombre positif, 6 décimales max).".into());
+                    self.send_error = Some(t(self.lang, "send.amount_invalid"));
                     return Task::none();
                 }
                 let tag_input = self.send_destination_tag.trim();
                 if !tag_input.is_empty() && tag_input.parse::<u32>().is_err() {
-                    self.send_error =
-                        Some("Destination tag invalide (doit être un nombre entier).".into());
+                    self.send_error = Some(t(self.lang, "send.tag_invalid"));
                     return Task::none();
                 }
                 // A password is only required if this wallet is actually
                 // encrypted -- an unencrypted wallet can be used to send
                 // without a password.
                 if wallet_encrypted && self.send_password.is_empty() {
-                    self.send_error = Some("Mot de passe manquant.".into());
+                    self.send_error = Some(t(self.lang, "wallet.password_required"));
                     return Task::none();
                 }
 
@@ -1012,9 +1013,7 @@ impl MyApp {
                             // field.
                             Ok(seed) => match self.seed_action {
                                 SeedAction::Copy => {
-                                    self.copy_seed_success = Some(
-                                        "Seed copiée dans le presse-papiers (effacement automatique dans 60s).".into(),
-                                    );
+                                    self.copy_seed_success = Some(t(self.lang, "copyseed.copied"));
                                     let seed_for_clear = seed.clone();
                                     return Task::batch([
                                         iced::clipboard::write(seed),
@@ -1030,12 +1029,14 @@ impl MyApp {
                                 SeedAction::ShowQr => match qr_code::Data::new(&seed) {
                                     Ok(data) => {
                                         self.copy_seed_qr = Some(data);
-                                        self.copy_seed_success = Some(
-                                            "QR code généré. Fermez cette fenêtre une fois le scan terminé.".into(),
-                                        );
+                                        self.copy_seed_success = Some(t(self.lang, "copyseed.qr_generated"));
                                     }
                                     Err(e) => {
-                                        self.copy_seed_error = Some(format!("Erreur QR : {:?}", e))
+                                        self.copy_seed_error = Some(t_args(
+                                            self.lang,
+                                            "qr.error",
+                                            &[("error", &format!("{:?}", e))],
+                                        ))
                                     }
                                 },
                             },
@@ -1071,10 +1072,7 @@ impl MyApp {
                 // must have explicitly checked the warning box before we
                 // sign/submit anything.
                 if self.dest_activated == Some(false) && !self.activation_acknowledged {
-                    self.send_error = Some(
-                        "Veuillez cocher la case confirmant l'activation du nouveau compte."
-                            .into(),
-                    );
+                    self.send_error = Some(t(self.lang, "send.activation_ack_required"));
                     return Task::none();
                 }
 
@@ -1085,7 +1083,7 @@ impl MyApp {
                 {
                     Some(w) => w.clone(),
                     None => {
-                        self.send_error = Some("Aucun wallet sélectionné.".into());
+                        self.send_error = Some(t(self.lang, "wallet.select_required"));
                         return Task::none();
                     }
                 };
@@ -1153,10 +1151,8 @@ impl MyApp {
                         self.sending = false;
                         match outcome {
                             Ok(hash) => {
-                                self.send_success = Some(format!(
-                                    "Transaction envoyée avec succès : {}",
-                                    hash
-                                ));
+                                self.send_success =
+                                    Some(t_args(self.lang, "send.success", &[("hash", &hash)]));
                                 self.send_destination.clear();
                                 self.send_amount.clear();
                                 drop(slot);
@@ -1190,22 +1186,23 @@ impl MyApp {
     fn main_view(&self) -> Element<Message> {
         let header = row![
             column![
-                text("V4X").size(32).color(ACCENT),
-                text("WALLET MANAGER").size(12).color(MUTED),
+                text(t(self.lang, "header.title")).size(32).color(ACCENT),
+                text(t(self.lang, "header.subtitle")).size(12).color(MUTED),
             ]
             .spacing(0),
             iced::widget::horizontal_space(),
             self.donation_buttons(),
+            pick_list(Lang::all().to_vec(), Some(self.lang), Message::LanguageChanged).text_size(13),
             self.network_toggle(),
         ]
         .spacing(20)
         .align_y(Alignment::Center)
         .width(Length::Fill);
 
-        let wallet_panel = card("PORTEFEUILLE", self.wallet_top_panel(), Length::Fill);
+        let wallet_panel = card(t(self.lang, "panel.wallet"), self.wallet_top_panel(), Length::Fill);
 
-        let actions_card = card("ACTIONS", self.actions_panel(), Length::Fixed(280.0));
-        let info_card = card("SOLDE & TRANSACTIONS", self.info_panel(), Length::Fill);
+        let actions_card = card(t(self.lang, "panel.actions"), self.actions_panel(), Length::Fixed(280.0));
+        let info_card = card(t(self.lang, "panel.balance"), self.info_panel(), Length::Fill);
 
         let lower = row![actions_card, info_card]
             .spacing(20)
@@ -1229,8 +1226,6 @@ impl MyApp {
             .into()
     }
 
-    /// Testnet/mainnet switch, with a label on each side that lights up to
-    /// clearly indicate the active state (orange = mainnet = real money).
     /// Small, unobtrusive donation shortcuts -- pre-fill the destination in
     /// the existing send flow rather than introducing a separate one, so
     /// they benefit from the same review/confirmation/activation-warning
@@ -1240,13 +1235,13 @@ impl MyApp {
         let has_selection = self.selected_unlocked.is_some();
 
         row![
-            button(text("Soutenir le créateur").size(12))
+            button(text(t(self.lang, "donate.creator")).size(12))
                 .padding([6, 10])
                 .style(secondary_button)
                 .on_press_maybe(
                     has_selection.then_some(Message::OpenDonationSend(CREATOR_DONATION_ADDRESS))
                 ),
-            button(text("Soutenir le développeur").size(12))
+            button(text(t(self.lang, "donate.dev")).size(12))
                 .padding([6, 10])
                 .style(secondary_button)
                 .on_press_maybe(
@@ -1258,11 +1253,13 @@ impl MyApp {
         .into()
     }
 
+    /// Testnet/mainnet switch, with a label on each side that lights up to
+    /// clearly indicate the active state (orange = mainnet = real money).
     fn network_toggle(&self) -> Element<Message> {
         let is_mainnet = self.network == NetworkChoice::Mainnet;
 
         row![
-            text("Testnet")
+            text(t(self.lang, "network.testnet"))
                 .size(13)
                 .color(if is_mainnet { MUTED } else { ACCENT }),
             toggler(is_mainnet)
@@ -1272,7 +1269,7 @@ impl MyApp {
                     NetworkChoice::Testnet
                 }))
                 .size(22),
-            text("Mainnet")
+            text(t(self.lang, "network.mainnet"))
                 .size(13)
                 .color(if is_mainnet { WARNING } else { MUTED }),
         ]
@@ -1289,13 +1286,13 @@ impl MyApp {
 
         let controls = row![
             pick_list(names, self.selected_unlocked.clone(), Message::SelectWallet)
-                .placeholder("Aucun wallet V4X déverrouillé")
+                .placeholder(t(self.lang, "wallet.picker_placeholder"))
                 .width(Length::Fill),
-            button(text("Créer").size(14))
+            button(text(t(self.lang, "wallet.create")).size(14))
                 .padding([10, 14])
                 .style(primary_button)
                 .on_press(Message::OpenCreateModal),
-            button(text("Charger").size(14))
+            button(text(t(self.lang, "wallet.load")).size(14))
                 .padding([10, 14])
                 .style(secondary_button)
                 .on_press(Message::OpenLoadModal),
@@ -1311,12 +1308,12 @@ impl MyApp {
         let address_line: Element<Message> = match selected {
             Some(w) => column![
                 row![
-                    text("ADRESSE").size(11).color(MUTED),
-                    button(text("Copier").size(12))
+                    text(t(self.lang, "wallet.address_label")).size(11).color(MUTED),
+                    button(text(t(self.lang, "wallet.copy_address")).size(12))
                         .padding([4, 10])
                         .style(secondary_button)
                         .on_press(Message::CopyAddress(w.address.clone())),
-                    button(text("Copier la seed").size(12))
+                    button(text(t(self.lang, "wallet.copy_seed")).size(12))
                         .padding([4, 10])
                         .style(secondary_button)
                         .on_press(Message::OpenCopySeedModal),
@@ -1327,7 +1324,7 @@ impl MyApp {
             ]
             .spacing(4)
             .into(),
-            None => text("Choisissez, créez ou chargez un wallet pour commencer.")
+            None => text(t(self.lang, "wallet.empty_hint"))
                 .size(12)
                 .color(MUTED)
                 .into(),
@@ -1341,13 +1338,13 @@ impl MyApp {
         let has_selection = self.selected_unlocked.is_some();
 
         let mut items: Vec<Element<Message>> = vec![
-            button(text("Envoyer").size(15))
+            button(text(t(self.lang, "actions.send")).size(15))
                 .padding(12)
                 .width(Length::Fill)
                 .style(primary_button)
                 .on_press_maybe(has_selection.then_some(Message::OpenSendModal))
                 .into(),
-            button(text("Rafraîchir").size(15))
+            button(text(t(self.lang, "actions.refresh")).size(15))
                 .padding(12)
                 .width(Length::Fill)
                 .style(secondary_button)
@@ -1360,9 +1357,9 @@ impl MyApp {
             items.push(
                 button(
                     text(if self.faucet_requesting {
-                        "Faucet en cours..."
+                        t(self.lang, "actions.faucet_loading")
                     } else {
-                        "XRP de test (faucet)"
+                        t(self.lang, "actions.faucet")
                     })
                     .size(15),
                 )
@@ -1393,34 +1390,34 @@ impl MyApp {
             .and_then(|name| self.unlocked_wallets.iter().find(|w| &w.name == name));
 
         let Some(_w) = selected else {
-            return text("Aucun wallet sélectionné.").size(13).color(MUTED).into();
+            return text(t(self.lang, "balance.none_selected")).size(13).color(MUTED).into();
         };
 
         let mut items: Vec<Element<Message>> = Vec::new();
 
         if self.info_loading {
-            items.push(text("Chargement...").size(13).color(MUTED).into());
+            items.push(text(t(self.lang, "balance.loading")).size(13).color(MUTED).into());
         } else if let Some(err) = &self.info_error {
             items.push(text(err).size(13).color(ERROR).into());
         } else if let Some(balance) = &self.current_balance {
             if !balance.activated {
                 items.push(
-                    text("⚠ Compte non activé sur ce réseau (0 XRP reçu).")
+                    text(t(self.lang, "balance.not_activated"))
                         .size(13)
                         .color(WARNING)
                         .into(),
                 );
             } else {
-                items.push(info_row("Solde XRP", &balance.xrp_balance));
+                items.push(info_row(t(self.lang, "balance.label"), &balance.xrp_balance));
             }
 
-            items.push(text("Dernières transactions").size(13).color(ACCENT).into());
+            items.push(text(t(self.lang, "balance.tx_title")).size(13).color(ACCENT).into());
 
             if self.current_txs.is_empty() {
-                items.push(text("Aucune transaction.").size(13).color(MUTED).into());
+                items.push(text(t(self.lang, "balance.tx_none")).size(13).color(MUTED).into());
             } else {
                 for tx in &self.current_txs {
-                    items.push(tx_row(tx));
+                    items.push(tx_row(tx, self.lang));
                 }
             }
         }
@@ -1429,33 +1426,37 @@ impl MyApp {
     }
 
     fn create_modal_view(&self) -> Element<Message> {
+        let name_placeholder = t(self.lang, "create.name_placeholder");
+        let password_placeholder = t(self.lang, "common.password_placeholder");
+        let password_confirm_placeholder = t(self.lang, "create.password_confirm_placeholder");
+
         let mut items: Vec<Element<Message>> = vec![
-            text("Créer un Wallet V4X").size(22).color(ACCENT).into(),
-            text_input("Nom du wallet", &self.wallet_name_input)
+            text(t(self.lang, "create.title")).size(22).color(ACCENT).into(),
+            text_input(&name_placeholder, &self.wallet_name_input)
                 .on_input(Message::WalletNameChanged)
                 .padding(10)
                 .into(),
             checkbox(
-                format!("Adresse V4X (débute par {})", V4X_PREFIX.to_lowercase()),
+                t_args(self.lang, "create.v4x_checkbox", &[("prefix", &V4X_PREFIX.to_lowercase())]),
                 self.use_v4x_address,
             )
             .on_toggle(Message::V4xAddressToggled)
             .into(),
-            checkbox("Chiffrer avec un mot de passe", self.use_encryption)
+            checkbox(t(self.lang, "create.encrypt_checkbox"), self.use_encryption)
                 .on_toggle(Message::EncryptionToggled)
                 .into(),
         ];
 
         if self.use_encryption {
             items.push(
-                text_input("Mot de passe", &self.password_input)
+                text_input(&password_placeholder, &self.password_input)
                     .on_input(Message::PasswordChanged)
                     .secure(true)
                     .padding(10)
                     .into(),
             );
             items.push(
-                text_input("Confirmer le mot de passe", &self.password_confirm_input)
+                text_input(&password_confirm_placeholder, &self.password_confirm_input)
                     .on_input(Message::PasswordConfirmChanged)
                     .secure(true)
                     .padding(10)
@@ -1465,7 +1466,7 @@ impl MyApp {
                 && self.password_input != self.password_confirm_input
             {
                 items.push(
-                    text("Les mots de passe ne correspondent pas.")
+                    text(t(self.lang, "create.password_mismatch"))
                         .size(12)
                         .color(WARNING)
                         .into(),
@@ -1475,9 +1476,10 @@ impl MyApp {
 
         if self.generating {
             items.push(
-                text(format!(
-                    "Recherche d'une adresse V4X en cours... Tentatives : {}",
-                    self.attempts.load(Ordering::Relaxed)
+                text(t_args(
+                    self.lang,
+                    "create.searching",
+                    &[("attempts", &self.attempts.load(Ordering::Relaxed).to_string())],
                 ))
                 .size(14)
                 .color(MUTED)
@@ -1494,7 +1496,7 @@ impl MyApp {
 
         if self.generating {
             items.push(
-                button(text("Arrêter la recherche").size(15))
+                button(text(t(self.lang, "create.stop_search")).size(15))
                     .padding(12)
                     .width(Length::Fill)
                     .style(secondary_button)
@@ -1506,7 +1508,7 @@ impl MyApp {
                 !self.use_encryption || self.password_input == self.password_confirm_input;
             let can_generate = !self.wallet_name_input.trim().is_empty() && passwords_ok;
             items.push(
-                button(text("Générer").size(15))
+                button(text(t(self.lang, "create.generate")).size(15))
                     .padding(12)
                     .width(Length::Fill)
                     .style(primary_button)
@@ -1516,7 +1518,7 @@ impl MyApp {
         }
 
         items.push(
-            button(text("Fermer").size(15))
+            button(text(t(self.lang, "common.close")).size(15))
                 .padding(12)
                 .width(Length::Fill)
                 .style(secondary_button)
@@ -1532,11 +1534,11 @@ impl MyApp {
 
     fn load_modal_view(&self) -> Element<Message> {
         let mut items: Vec<Element<Message>> =
-            vec![text("Charger un Wallet V4X").size(22).color(ACCENT).into()];
+            vec![text(t(self.lang, "load.title")).size(22).color(ACCENT).into()];
 
         if self.available_wallets.is_empty() {
             items.push(
-                text("Aucun wallet trouvé dans le dossier wallets/.")
+                text(t(self.lang, "load.none_found"))
                     .color(MUTED)
                     .into(),
             );
@@ -1548,7 +1550,7 @@ impl MyApp {
                     self.selected_wallet_file.as_ref().map(|w| w.name.clone()),
                     Message::SelectWalletFile,
                 )
-                .placeholder("Choisir un wallet")
+                .placeholder(t(self.lang, "load.picker_placeholder"))
                 .width(Length::Fill)
                 .into(),
             );
@@ -1561,8 +1563,9 @@ impl MyApp {
             .unwrap_or(false);
 
         if needs_password {
+            let password_placeholder = t(self.lang, "common.password_placeholder");
             items.push(
-                text_input("Mot de passe", &self.load_password)
+                text_input(&password_placeholder, &self.load_password)
                     .on_input(Message::LoadPasswordChanged)
                     .secure(true)
                     .padding(10)
@@ -1571,7 +1574,7 @@ impl MyApp {
         }
 
         if self.loading {
-            items.push(text("Déchiffrement...").size(13).color(MUTED).into());
+            items.push(text(t(self.lang, "common.decrypting")).size(13).color(MUTED).into());
         }
         if let Some(err) = &self.load_error {
             items.push(text(err).color(ERROR).into());
@@ -1582,7 +1585,7 @@ impl MyApp {
             && !self.loading;
 
         items.push(
-            button(text("Charger").size(15))
+            button(text(t(self.lang, "wallet.load")).size(15))
                 .padding(12)
                 .width(Length::Fill)
                 .style(primary_button)
@@ -1590,7 +1593,7 @@ impl MyApp {
                 .into(),
         );
         items.push(
-            button(text("Annuler").size(15))
+            button(text(t(self.lang, "common.cancel")).size(15))
                 .padding(12)
                 .width(Length::Fill)
                 .style(secondary_button)
@@ -1617,19 +1620,17 @@ impl MyApp {
             .unwrap_or(false);
 
         let mut items: Vec<Element<Message>> = vec![
-            text("Copier la seed").size(22).color(ACCENT).into(),
-            text(
-                "Cette clé donne un accès total et irrévocable aux fonds de ce wallet. \
-                 Ne la partagez avec personne et ne la collez que dans un endroit sûr."
-            )
-            .size(12)
-            .color(WARNING)
-            .into(),
+            text(t(self.lang, "copyseed.title")).size(22).color(ACCENT).into(),
+            text(t(self.lang, "copyseed.warning"))
+                .size(12)
+                .color(WARNING)
+                .into(),
         ];
 
         if wallet_encrypted {
+            let password_placeholder = t(self.lang, "common.wallet_password_placeholder");
             items.push(
-                text_input("Mot de passe du wallet", &self.copy_seed_password)
+                text_input(&password_placeholder, &self.copy_seed_password)
                     .on_input(Message::CopySeedPasswordChanged)
                     .secure(true)
                     .padding(10)
@@ -1638,7 +1639,7 @@ impl MyApp {
         }
 
         if self.copy_seed_loading {
-            items.push(text("Déchiffrement...").size(13).color(MUTED).into());
+            items.push(text(t(self.lang, "common.decrypting")).size(13).color(MUTED).into());
         }
         if let Some(err) = &self.copy_seed_error {
             items.push(text(err).color(ERROR).into());
@@ -1661,7 +1662,7 @@ impl MyApp {
             && (!wallet_encrypted || !self.copy_seed_password.is_empty());
 
         items.push(
-            button(text("Afficher le QR code").size(15))
+            button(text(t(self.lang, "copyseed.show_qr")).size(15))
                 .padding(12)
                 .width(Length::Fill)
                 .style(primary_button)
@@ -1669,7 +1670,7 @@ impl MyApp {
                 .into(),
         );
         items.push(
-            button(text("Copier la seed dans le presse-papiers").size(15))
+            button(text(t(self.lang, "copyseed.copy_button")).size(15))
                 .padding(12)
                 .width(Length::Fill)
                 .style(warning_button)
@@ -1677,7 +1678,7 @@ impl MyApp {
                 .into(),
         );
         items.push(
-            button(text("Fermer").size(15))
+            button(text(t(self.lang, "common.close")).size(15))
                 .padding(12)
                 .width(Length::Fill)
                 .style(secondary_button)
@@ -1699,7 +1700,7 @@ impl MyApp {
         let wallet_label = self
             .selected_unlocked
             .clone()
-            .unwrap_or_else(|| "Aucun wallet sélectionné".to_string());
+            .unwrap_or_else(|| t(self.lang, "wallet.select_required"));
 
         let wallet_encrypted = self
             .selected_unlocked
@@ -1708,17 +1709,26 @@ impl MyApp {
             .map(|w| w.encrypted)
             .unwrap_or(false);
 
+        let destination_placeholder = t(self.lang, "send.destination_placeholder");
+        let amount_placeholder = t(self.lang, "send.amount_placeholder");
+        let tag_placeholder = t(self.lang, "send.tag_placeholder");
+        let wallet_password_placeholder = t(self.lang, "common.wallet_password_placeholder");
+
         let mut items: Vec<Element<Message>> = vec![
-            text("Envoyer des XRP").size(22).color(ACCENT).into(),
-            text(format!("Depuis : {} ({})", wallet_label, self.network.as_str()))
-                .size(13)
-                .color(MUTED)
-                .into(),
+            text(t(self.lang, "send.title")).size(22).color(ACCENT).into(),
+            text(t_args(
+                self.lang,
+                "send.from_line",
+                &[("wallet", &wallet_label), ("network", self.network.as_str())],
+            ))
+            .size(13)
+            .color(MUTED)
+            .into(),
             row![
-                text_input("Adresse destinataire (r...)", &self.send_destination)
+                text_input(&destination_placeholder, &self.send_destination)
                     .on_input(Message::SendDestinationChanged)
                     .padding(10),
-                button(text("Coller").size(13))
+                button(text(t(self.lang, "send.paste_button")).size(13))
                     .padding([10, 14])
                     .style(secondary_button)
                     .on_press(Message::PasteDestination),
@@ -1726,11 +1736,11 @@ impl MyApp {
             .spacing(10)
             .align_y(Alignment::Center)
             .into(),
-            text_input("Montant en XRP", &self.send_amount)
+            text_input(&amount_placeholder, &self.send_amount)
                 .on_input(Message::SendAmountChanged)
                 .padding(10)
                 .into(),
-            text_input("Destination tag (optionnel)", &self.send_destination_tag)
+            text_input(&tag_placeholder, &self.send_destination_tag)
                 .on_input(Message::SendDestinationTagChanged)
                 .padding(10)
                 .into(),
@@ -1740,7 +1750,7 @@ impl MyApp {
         // misleading) to ask the user to enter one.
         if wallet_encrypted {
             items.push(
-                text_input("Mot de passe du wallet", &self.send_password)
+                text_input(&wallet_password_placeholder, &self.send_password)
                     .on_input(Message::SendPasswordChanged)
                     .secure(true)
                     .padding(10)
@@ -1748,7 +1758,7 @@ impl MyApp {
             );
         } else if self.selected_unlocked.is_some() {
             items.push(
-                text("Ce wallet n'est pas chiffré : aucun mot de passe requis.")
+                text(t(self.lang, "send.no_password_needed"))
                     .size(12)
                     .color(MUTED)
                     .into(),
@@ -1757,7 +1767,7 @@ impl MyApp {
 
         if self.network == NetworkChoice::Mainnet {
             items.push(
-                text("MAINNET -- cette transaction utilisera du XRP réel.")
+                text(t(self.lang, "send.mainnet_warning"))
                     .size(13)
                     .color(WARNING)
                     .into(),
@@ -1774,7 +1784,7 @@ impl MyApp {
         let can_review = self.selected_unlocked.is_some() && !self.sending;
 
         items.push(
-            button(text("Vérifier et confirmer").size(15))
+            button(text(t(self.lang, "send.review_button")).size(15))
                 .padding(12)
                 .width(Length::Fill)
                 .style(primary_button)
@@ -1782,7 +1792,7 @@ impl MyApp {
                 .into(),
         );
         items.push(
-            button(text("Fermer").size(15))
+            button(text(t(self.lang, "common.close")).size(15))
                 .padding(12)
                 .width(Length::Fill)
                 .style(secondary_button)
@@ -1807,24 +1817,24 @@ impl MyApp {
         let tag = self.confirmed_destination_tag.as_str();
 
         let mut items: Vec<Element<Message>> = vec![
-            text("Confirmer l'envoi").size(22).color(ACCENT).into(),
-            text("Vérifiez attentivement avant de continuer -- une transaction XRPL est irréversible.")
+            text(t(self.lang, "confirm.title")).size(22).color(ACCENT).into(),
+            text(t(self.lang, "confirm.warning"))
                 .size(12)
                 .color(MUTED)
                 .into(),
-            owned_info_row("Depuis", wallet_label),
-            owned_info_row("Vers", self.confirmed_destination.clone()),
-            owned_info_row("Montant", format!("{} XRP", self.confirmed_amount)),
+            owned_info_row(t(self.lang, "confirm.from_label"), wallet_label),
+            owned_info_row(t(self.lang, "confirm.to_label"), self.confirmed_destination.clone()),
+            owned_info_row(t(self.lang, "confirm.amount_label"), format!("{} XRP", self.confirmed_amount)),
         ];
 
         if !tag.is_empty() {
-            items.push(owned_info_row("Destination tag", tag.to_string()));
+            items.push(owned_info_row(t(self.lang, "confirm.tag_label"), tag.to_string()));
         }
-        items.push(info_row("Réseau", self.network.as_str()));
+        items.push(info_row(t(self.lang, "confirm.network_label"), self.network.as_str()));
 
         if self.network == NetworkChoice::Mainnet {
             items.push(
-                text("MAINNET -- cette transaction utilisera du XRP réel et est irréversible.")
+                text(t(self.lang, "confirm.mainnet_warning"))
                     .size(13)
                     .color(WARNING)
                     .into(),
@@ -1834,35 +1844,28 @@ impl MyApp {
         // --- Destination account activation status ---
         if self.dest_check_loading {
             items.push(
-                text("Vérification du compte destinataire...")
+                text(t(self.lang, "confirm.checking_dest"))
                     .size(13)
                     .color(MUTED)
                     .into(),
             );
         } else if let Some(err) = &self.dest_check_error {
             items.push(
-                text(format!(
-                    "Impossible de vérifier ce compte ({}). Vérifiez l'adresse avec soin avant de continuer.",
-                    err
-                ))
-                .size(12)
-                .color(WARNING)
-                .into(),
+                text(t_args(self.lang, "confirm.check_failed", &[("error", err)]))
+                    .size(12)
+                    .color(WARNING)
+                    .into(),
             );
         } else if self.dest_activated == Some(false) {
             items.push(
                 container(
                     column![
-                        text("Compte destinataire non activé").size(14).color(WARNING),
-                        text(
-                            "Cette adresse n'existe pas encore sur le réseau. Cet envoi va \
-                             l'ACTIVER en tant que nouveau compte -- assurez-vous que l'adresse \
-                             est correcte : un envoi vers une mauvaise adresse est irréversible."
-                        )
+                        text(t(self.lang, "confirm.not_activated_title")).size(14).color(WARNING),
+                        text(t(self.lang, "confirm.not_activated_body"))
                         .size(12)
                         .color(MUTED),
                         checkbox(
-                            "Je comprends et je souhaite activer ce nouveau compte.",
+                            t(self.lang, "confirm.activation_checkbox"),
                             self.activation_acknowledged,
                         )
                         .on_toggle(Message::AcknowledgeActivation),
@@ -1884,7 +1887,7 @@ impl MyApp {
         }
 
         if self.sending {
-            items.push(text("Envoi en cours...").size(14).color(MUTED).into());
+            items.push(text(t(self.lang, "confirm.sending")).size(14).color(MUTED).into());
         }
         if let Some(err) = &self.send_error {
             items.push(text(err).color(ERROR).into());
@@ -1897,7 +1900,7 @@ impl MyApp {
         let can_send = !self.sending && !self.dest_check_loading && !needs_ack;
 
         items.push(
-            button(text("Confirmer l'envoi").size(15))
+            button(text(t(self.lang, "confirm.send_button")).size(15))
                 .padding(12)
                 .width(Length::Fill)
                 .style(if self.network == NetworkChoice::Mainnet {
@@ -1909,7 +1912,7 @@ impl MyApp {
                 .into(),
         );
         items.push(
-            button(text("Modifier").size(15))
+            button(text(t(self.lang, "confirm.edit_button")).size(15))
                 .padding(12)
                 .width(Length::Fill)
                 .style(secondary_button)
@@ -1917,7 +1920,7 @@ impl MyApp {
                 .into(),
         );
         items.push(
-            button(text("Fermer").size(15))
+            button(text(t(self.lang, "common.close")).size(15))
                 .padding(12)
                 .width(Length::Fill)
                 .style(secondary_button)
@@ -1934,9 +1937,9 @@ impl MyApp {
 
 /// Renders a labeled, scrollable value row (e.g. "ADDRESS" / the address
 /// value).
-fn info_row<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
+fn info_row<'a>(label: impl Into<String>, value: &'a str) -> Element<'a, Message> {
     column![
-        text(label.to_uppercase()).size(11).color(MUTED),
+        text(label.into().to_uppercase()).size(11).color(MUTED),
         scrollable(text(value).size(14).color(ACCENT)).width(Length::Fill),
     ]
     .spacing(4)
@@ -1946,9 +1949,9 @@ fn info_row<'a>(label: &'a str, value: &'a str) -> Element<'a, Message> {
 /// Variant of `info_row` for a locally computed value (e.g. `format!(...)`)
 /// -- takes an owned `String` rather than a reference, to avoid any lifetime
 /// issue with a temporary value.
-fn owned_info_row(label: &'static str, value: String) -> Element<'static, Message> {
+fn owned_info_row(label: impl Into<String>, value: String) -> Element<'static, Message> {
     column![
-        text(label.to_uppercase()).size(11).color(MUTED),
+        text(label.into().to_uppercase()).size(11).color(MUTED),
         scrollable(text(value).size(14).color(ACCENT)).width(Length::Fill),
     ]
     .spacing(4)
@@ -1979,7 +1982,7 @@ fn looks_like_xrp_amount(amount: &str) -> bool {
         && frac.len() <= 6
 }
 
-fn tx_row(tx: &TxInfo) -> Element<'static, Message> {
+fn tx_row(tx: &TxInfo, lang: Lang) -> Element<'static, Message> {
     let amount = tx.amount_xrp.clone().unwrap_or_else(|| "-".to_string());
     let date = tx.date.clone().unwrap_or_else(|| "-".to_string());
     let hash_short = if tx.hash.len() > 14 {
@@ -1987,9 +1990,10 @@ fn tx_row(tx: &TxInfo) -> Element<'static, Message> {
     } else {
         tx.hash.clone()
     };
+    let tag_label = t(lang, "tx.tag_label");
     let tag_suffix = tx
         .destination_tag
-        .map(|t| format!(" (tag: {})", t))
+        .map(|tag_value| format!(" ({}: {})", tag_label, tag_value))
         .unwrap_or_default();
 
     column![
@@ -2019,8 +2023,12 @@ fn card_style(_theme: &Theme) -> container::Style {
 }
 
 /// Wraps `content` in a titled panel ("card") of the given width.
-fn card<'a>(title: &'a str, content: Element<'a, Message>, width: Length) -> Element<'a, Message> {
-    container(column![text(title).size(13).color(TITLE_COLOR), content].spacing(16))
+/// Wraps `content` in a titled panel ("card") of the given width. Takes an
+/// owned title (rather than `&str`) so callers can pass the result of
+/// `t(...)` directly without needing a separate local binding to keep a
+/// temporary alive.
+fn card<'a>(title: impl Into<String>, content: Element<'a, Message>, width: Length) -> Element<'a, Message> {
+    container(column![text(title.into()).size(13).color(TITLE_COLOR), content].spacing(16))
         .padding(20)
         .width(width)
         .style(card_style)
