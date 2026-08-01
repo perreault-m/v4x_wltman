@@ -15,12 +15,16 @@
 mod wallet;
 #[path = "../i18n.rs"]
 mod i18n;
+#[path = "../ui.rs"]
+mod ui;
 
 use iced::widget::{
-    button, center, checkbox, column, container, mouse_area, opaque, pick_list, qr_code, row,
-    scrollable, stack, text, text_input, toggler, Column,
+    button, checkbox, column, container, pick_list, qr_code, row, scrollable, text, text_input,
+    toggler, Column,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Size, Task, Theme};
+use plotters::prelude::*;
+use plotters_iced::{Chart, ChartWidget};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,24 +32,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use i18n::{t, t_args, Lang};
+use ui::{
+    card, card_style, info_row, modal, owned_info_row, primary_button, secondary_button, tab_bar,
+    warning_button, ACCENT, ERROR, MUTED, PAGE_BG, SUCCESS, WARNING,
+};
 use wallet::{Wallet, WalletFile};
-
-// --- "V4X" palette: technological green on a very dark background ---
-const ACCENT: Color = Color::from_rgb(0.0, 0.95, 0.35);
-const ACCENT_HOVER: Color = Color::from_rgb(0.25, 1.0, 0.55);
-const ACCENT_PRESS: Color = Color::from_rgb(0.0, 0.65, 0.25);
-const WARNING: Color = Color::from_rgb(1.0, 0.62, 0.0);
-const WARNING_HOVER: Color = Color::from_rgb(1.0, 0.75, 0.25);
-const SUCCESS: Color = Color::from_rgb(0.25, 0.95, 0.45);
-const ERROR: Color = Color::from_rgb(1.0, 0.35, 0.35);
-const MUTED: Color = Color::from_rgb(0.55, 0.68, 0.6);
-/// Burnt orange used for panel titles ("PORTEFEUILLE", "ACTIONS",
-/// "SOLDE & TRANSACTIONS"), to distinguish them from the green accent used
-/// elsewhere (addresses, active states, etc).
-const TITLE_COLOR: Color = Color::from_rgb(0.80, 0.40, 0.12);
-const PAGE_BG: Color = Color::from_rgb(0.02, 0.03, 0.025);
-const PANEL_BG: Color = Color::from_rgb(0.05, 0.08, 0.06);
-const PANEL_BORDER: Color = Color::from_rgba(0.0, 0.95, 0.35, 0.25);
 
 const V4X_PREFIX: &str = "RV4X";
 
@@ -165,6 +156,93 @@ impl NetworkChoice {
     }
 }
 
+/// A top-level tab in the main window. Adding a new one:
+/// 1. Add a variant here.
+/// 2. Add its `(Tab, i18n_key)` entry to the `TABS` list in
+///    [`MyApp::main_view`], where `ui::tab_bar` is called.
+/// 3. Add a matching arm in [`MyApp::main_view`] that renders its content
+///    (typically a small `xxx_tab_view(&self) -> Element<Message>` method,
+///    following `wallet_tab_view`/`trade_tab_view` as examples).
+/// That's it -- the tab bar, selection state, and switching logic are all
+/// generic over this enum and don't need to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Tab {
+    #[default]
+    Wallet,
+    Trade,
+}
+
+/// An XRPL issued-currency token, as offered in the Trade tab's token
+/// picker. Currently hand-written placeholder data (see
+/// [`dummy_trade_tokens`]) -- once token discovery is wired up (e.g. via a
+/// DEX/order-book query or a curated token list), this becomes the
+/// deserialization target for that instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TradeToken {
+    /// Currency code, e.g. `"USD"`, `"EUR"`. Not validated here (a real
+    /// XRPL currency code can be a standard 3-letter ISO code or a 40-char
+    /// hex code) since this is placeholder data.
+    currency: String,
+    /// Human-readable issuer name, shown alongside the currency to
+    /// disambiguate (the same currency code can be issued by many
+    /// different accounts on the XRPL, each a distinct, non-fungible
+    /// trust line).
+    issuer_label: String,
+}
+
+impl std::fmt::Display for TradeToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.currency, self.issuer_label)
+    }
+}
+
+/// Placeholder token list for the Trade tab, standing in for real token
+/// discovery (to be added later). Modeled after commonly-traded XRPL
+/// issued currencies so the UI looks realistic in the meantime.
+fn dummy_trade_tokens() -> Vec<TradeToken> {
+    vec![
+        TradeToken { currency: "USD".into(), issuer_label: "Bitstamp".into() },
+        TradeToken { currency: "USD".into(), issuer_label: "GateHub".into() },
+        TradeToken { currency: "EUR".into(), issuer_label: "GateHub".into() },
+        TradeToken { currency: "BTC".into(), issuer_label: "Bitstamp".into() },
+    ]
+}
+
+/// OHLC/candlestick price chart for the Trade tab, rendered via
+/// `plotters`/`plotters-iced`. Currently draws just the axes with no data
+/// series -- once historical candle data is available, `build_chart` is
+/// where a `plotters::series::CandleStick` series gets added, fed from a
+/// `Vec` of OHLC points held on `MyApp` (refreshed the same
+/// background-thread + `Tick*` polling way as balance/transactions are).
+#[derive(Debug, Clone, Copy, Default)]
+struct OhlcChart;
+
+impl Chart<Message> for OhlcChart {
+    type State = ();
+
+    fn build_chart<DB: DrawingBackend>(&self, _state: &Self::State, mut builder: ChartBuilder<DB>) {
+        // Placeholder axis ranges (0..1) -- once real OHLC data is plotted,
+        // these become the actual time range and price min/max of the
+        // candles being shown.
+        let Ok(mut chart) = builder
+            .margin(10)
+            .x_label_area_size(28)
+            .y_label_area_size(44)
+            .build_cartesian_2d(0f32..1f32, 0f32..1f32)
+        else {
+            return;
+        };
+
+        let _ = chart
+            .configure_mesh()
+            .x_labels(0)
+            .y_labels(0)
+            .disable_x_mesh()
+            .disable_y_mesh()
+            .draw();
+    }
+}
+
 /// What to do with the seed once it's been fetched from the `cli` process --
 /// set right before the fetch starts, consulted when the result comes back
 /// in `Message::TickCopySeed`.
@@ -216,6 +294,7 @@ struct MyApp {
     modal: Modal,
     network: NetworkChoice,
     lang: Lang,
+    active_tab: Tab,
 
     // --- creation ---
     wallet_name_input: String,
@@ -304,6 +383,10 @@ struct MyApp {
     /// rather than text doesn't reduce what's held in memory, only how it's
     /// displayed.
     copy_seed_qr: Option<qr_code::Data>,
+
+    // --- trade tab ---
+    selected_trade_token: Option<TradeToken>,
+    ohlc_chart: OhlcChart,
 }
 
 #[derive(Debug, Clone)]
@@ -319,6 +402,7 @@ enum Message {
 
     NetworkChanged(NetworkChoice),
     LanguageChanged(Lang),
+    TabSelected(Tab),
 
     WalletNameChanged(String),
     V4xAddressToggled(bool),
@@ -367,6 +451,10 @@ enum Message {
     CopySeedToClipboard,
     ShowSeedQr,
     TickCopySeed,
+
+    TradeTokenSelected(TradeToken),
+    TradeBuy,
+    TradeSell,
 }
 
 impl MyApp {
@@ -591,6 +679,7 @@ impl MyApp {
                 }
             }
             Message::LanguageChanged(lang) => self.lang = lang,
+            Message::TabSelected(tab) => self.active_tab = tab,
 
             Message::WalletNameChanged(s) => self.wallet_name_input = s,
             Message::V4xAddressToggled(v) => self.use_v4x_address = v,
@@ -1166,6 +1255,14 @@ impl MyApp {
                     }
                 }
             }
+
+            Message::TradeTokenSelected(token) => self.selected_trade_token = Some(token),
+            // Both are no-ops for now: order construction/submission gets
+            // wired up once the DEX/trading backend exists. Kept as
+            // separate messages (rather than one combined "TradeSubmit")
+            // since buy/sell will need different order sides once real.
+            Message::TradeBuy => {}
+            Message::TradeSell => {}
         }
 
         Task::none()
@@ -1199,17 +1296,19 @@ impl MyApp {
         .align_y(Alignment::Center)
         .width(Length::Fill);
 
-        let wallet_panel = card(t(self.lang, "panel.wallet"), self.wallet_top_panel(), Length::Fill);
+        const TABS: &[(Tab, &str)] = &[(Tab::Wallet, "tabs.wallet"), (Tab::Trade, "tabs.trade")];
+        let tab_bar = tab_bar(
+            TABS.iter().map(|&(tab, key)| (tab, t(self.lang, key))),
+            self.active_tab,
+            Message::TabSelected,
+        );
 
-        let actions_card = card(t(self.lang, "panel.actions"), self.actions_panel(), Length::Fixed(280.0));
-        let info_card = card(t(self.lang, "panel.balance"), self.info_panel(), Length::Fill);
+        let tab_content: Element<Message> = match self.active_tab {
+            Tab::Wallet => self.wallet_tab_view(),
+            Tab::Trade => self.trade_tab_view(),
+        };
 
-        let lower = row![actions_card, info_card]
-            .spacing(20)
-            .align_y(Alignment::Start)
-            .width(Length::Fill);
-
-        let content = column![header, wallet_panel, lower]
+        let content = column![header, tab_bar, tab_content]
             .spacing(20)
             .padding(30)
             .width(Length::Fill)
@@ -1224,6 +1323,75 @@ impl MyApp {
                 ..container::Style::default()
             })
             .into()
+    }
+
+    /// Content of the "Wallet" tab: the original wallet management UI
+    /// (top wallet picker/address bar, actions panel, balance/tx panel).
+    fn wallet_tab_view(&self) -> Element<Message> {
+        let wallet_panel = card(t(self.lang, "panel.wallet"), self.wallet_top_panel(), Length::Fill);
+
+        let actions_card = card(t(self.lang, "panel.actions"), self.actions_panel(), Length::Fixed(280.0));
+        let info_card = card(t(self.lang, "panel.balance"), self.info_panel(), Length::Fill);
+
+        let lower = row![actions_card, info_card]
+            .spacing(20)
+            .align_y(Alignment::Start)
+            .width(Length::Fill);
+
+        column![wallet_panel, lower].spacing(20).width(Length::Fill).into()
+    }
+
+    /// Content of the "Trade" tab. Empty placeholder for now -- next
+    /// features (order book, swap, etc.) get added here.
+    fn trade_tab_view(&self) -> Element<Message> {
+        let tokens = dummy_trade_tokens();
+
+        let token_picker = pick_list(
+            tokens,
+            self.selected_trade_token.clone(),
+            Message::TradeTokenSelected,
+        )
+        .placeholder(t(self.lang, "trade.token_placeholder"))
+        .width(Length::Fixed(260.0));
+
+        let token_row = row![
+            text(t(self.lang, "trade.token_label")).size(12).color(MUTED),
+            token_picker,
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+
+        // Placeholder empty chart -- see `OhlcChart::build_chart` for where
+        // a real candlestick series gets added once historical OHLC data is
+        // available.
+        let chart = container(
+            ChartWidget::new(self.ohlc_chart)
+                .width(Length::Fill)
+                .height(Length::Fixed(320.0)),
+        )
+        .padding(4)
+        .width(Length::Fill)
+        .style(card_style);
+
+        let has_token = self.selected_trade_token.is_some();
+        let buy_sell_row = row![
+            button(text(t(self.lang, "trade.buy")).size(15))
+                .padding(12)
+                .width(Length::Fill)
+                .style(primary_button)
+                .on_press_maybe(has_token.then_some(Message::TradeBuy)),
+            button(text(t(self.lang, "trade.sell")).size(15))
+                .padding(12)
+                .width(Length::Fill)
+                .style(warning_button)
+                .on_press_maybe(has_token.then_some(Message::TradeSell)),
+        ]
+        .spacing(14);
+
+        let body: Element<Message> =
+            column![token_row, chart, buy_sell_row].spacing(16).into();
+
+        card(t(self.lang, "tabs.trade"), body, Length::Fill)
     }
 
     /// Small, unobtrusive donation shortcuts -- pre-fill the destination in
@@ -1935,29 +2103,6 @@ impl MyApp {
     }
 }
 
-/// Renders a labeled, scrollable value row (e.g. "ADDRESS" / the address
-/// value).
-fn info_row<'a>(label: impl Into<String>, value: &'a str) -> Element<'a, Message> {
-    column![
-        text(label.into().to_uppercase()).size(11).color(MUTED),
-        scrollable(text(value).size(14).color(ACCENT)).width(Length::Fill),
-    ]
-    .spacing(4)
-    .into()
-}
-
-/// Variant of `info_row` for a locally computed value (e.g. `format!(...)`)
-/// -- takes an owned `String` rather than a reference, to avoid any lifetime
-/// issue with a temporary value.
-fn owned_info_row(label: impl Into<String>, value: String) -> Element<'static, Message> {
-    column![
-        text(label.into().to_uppercase()).size(11).color(MUTED),
-        scrollable(text(value).size(14).color(ACCENT)).width(Length::Fill),
-    ]
-    .spacing(4)
-    .into()
-}
-
 /// Lightweight check (not a full Base58Check validation) to catch obvious
 /// typos before asking the user for confirmation.
 fn looks_like_xrpl_address(addr: &str) -> bool {
@@ -2005,117 +2150,5 @@ fn tx_row(tx: &TxInfo, lang: Lang) -> Element<'static, Message> {
         text(format!("{}    {}", date, hash_short)).size(11).color(MUTED),
     ]
     .spacing(2)
-    .into()
-}
-
-/// Common style for panels ("cards"): slightly greenish dark background,
-/// subtle green border, rounded corners.
-fn card_style(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(PANEL_BG)),
-        border: Border {
-            color: PANEL_BORDER,
-            width: 1.0,
-            radius: 10.0.into(),
-        },
-        ..container::Style::default()
-    }
-}
-
-/// Wraps `content` in a titled panel ("card") of the given width.
-/// Wraps `content` in a titled panel ("card") of the given width. Takes an
-/// owned title (rather than `&str`) so callers can pass the result of
-/// `t(...)` directly without needing a separate local binding to keep a
-/// temporary alive.
-fn card<'a>(title: impl Into<String>, content: Element<'a, Message>, width: Length) -> Element<'a, Message> {
-    container(column![text(title.into()).size(13).color(TITLE_COLOR), content].spacing(16))
-        .padding(20)
-        .width(width)
-        .style(card_style)
-        .into()
-}
-
-fn primary_button(_theme: &Theme, status: button::Status) -> button::Style {
-    let background = match status {
-        button::Status::Hovered => ACCENT_HOVER,
-        button::Status::Pressed => ACCENT_PRESS,
-        button::Status::Disabled => Color { a: 0.3, ..ACCENT },
-        button::Status::Active => ACCENT,
-    };
-
-    button::Style {
-        background: Some(Background::Color(background)),
-        text_color: Color::BLACK,
-        border: Border {
-            radius: 8.0.into(),
-            width: 0.0,
-            color: Color::TRANSPARENT,
-        },
-        ..button::Style::default()
-    }
-}
-
-/// Warning variant of the primary button (orange background) -- used for the
-/// "Send" action when the active network is mainnet (real money).
-fn warning_button(_theme: &Theme, status: button::Status) -> button::Style {
-    let background = match status {
-        button::Status::Hovered => WARNING_HOVER,
-        button::Status::Pressed => WARNING,
-        button::Status::Disabled => Color { a: 0.3, ..WARNING },
-        button::Status::Active => WARNING,
-    };
-
-    button::Style {
-        background: Some(Background::Color(background)),
-        text_color: Color::BLACK,
-        border: Border {
-            radius: 8.0.into(),
-            width: 0.0,
-            color: Color::TRANSPARENT,
-        },
-        ..button::Style::default()
-    }
-}
-
-fn secondary_button(_theme: &Theme, status: button::Status) -> button::Style {
-    let (border_color, text_color, fill_alpha) = match status {
-        button::Status::Hovered => (ACCENT, ACCENT, 0.1),
-        button::Status::Pressed => (ACCENT, ACCENT, 0.18),
-        button::Status::Disabled => (Color { a: 0.3, ..ACCENT }, Color { a: 0.3, ..ACCENT }, 0.0),
-        button::Status::Active => (ACCENT, ACCENT, 0.0),
-    };
-
-    button::Style {
-        background: Some(Background::Color(Color {
-            a: fill_alpha,
-            ..ACCENT
-        })),
-        text_color,
-        border: Border {
-            radius: 8.0.into(),
-            width: 1.5,
-            color: border_color,
-        },
-        ..button::Style::default()
-    }
-}
-
-/// Overlays `content` on top of `base` with a near-opaque background
-/// (clicking outside the content sends `on_blur`, typically to close the modal).
-fn modal<'a>(
-    base: Element<'a, Message>,
-    content: Element<'a, Message>,
-    on_blur: Message,
-) -> Element<'a, Message> {
-    stack![
-        base,
-        opaque(
-            mouse_area(center(opaque(content)).style(|_theme| container::Style {
-                background: Some(Background::Color(Color { a: 0.92, ..Color::BLACK })),
-                ..container::Style::default()
-            }))
-            .on_press(on_blur)
-        )
-    ]
     .into()
 }

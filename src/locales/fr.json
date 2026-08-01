@@ -97,5 +97,9 @@
   "confirm.send_button": "Confirmer l'envoi",
   "confirm.edit_button": "Modifier",
 
-  "faucet.success": "Requête acceptée. Rafraîchissez dans quelques secondes pour voir le solde."
+  "faucet.success": "Requête acceptée. Rafraîchissez dans quelques secondes pour voir le solde.",
+
+  "tabs.wallet" : "Portefeuille",
+  "tabs.trade" : "Trade",
+  "tabs.coming_soon" : "A venir"
 }

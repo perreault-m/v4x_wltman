@@ -31,6 +31,17 @@ directories = "6"
 iced = { version = "0.13", features = ["tokio", "advanced", "qr_code"] }
 tokio = { version = "1", features = ["time", "rt-multi-thread", "macros", "process"] }
 
+# Charting (Trade tab -- OHLC/candlestick price chart). `plotters` is the
+# de-facto standard pure-Rust charting library; `plotters-iced` embeds a
+# `plotters` drawing surface as a regular `iced` widget (no webview/JS, no
+# extra runtime -- consistent with this app's "everything local" stance).
+# `default-features = false` drops plotters' bitmap/image backends we don't
+# need here (we only render into the iced/GPU surface via plotters-iced).
+# NOTE: pin/bump `plotters-iced` to whatever version tracks `iced = "0.13"`
+# on crates.io at the time you add this -- verify with `cargo add plotters-iced`.
+plotters = { version = "0.3", default-features = false, features = ["chrono"] }
+plotters-iced = "0.11"
+
 # Réseau XRPL (utilisé par le CLI uniquement)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Construction/signature/soumission de transaction -- API haut niveau async,
