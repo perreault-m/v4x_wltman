@@ -421,6 +421,176 @@ pub async fn fetch_transactions(
     Ok(out)
 }
 
+/// Runs a typed `xrpl-mithril` request against each of the network's
+/// candidate servers in turn -- same retry policy as [`rpc_call`]: keep
+/// trying the next candidate on a server-health problem (unreachable,
+/// timeout, amendment-blocked), bail out immediately on anything else (e.g.
+/// `actNotFound`, which every honest node would answer identically, so
+/// retrying elsewhere would be pointless).
+///
+/// This exists alongside [`rpc_call`] (used by `fetch_balance` /
+/// `fetch_transactions`) rather than replacing it: those two already have a
+/// working hand-rolled JSON-RPC path, and there's no reason to touch it.
+/// This helper is for new read calls -- starting with tokens/NFTs below --
+/// built directly on `xrpl-mithril`'s typed request/response models instead
+/// of hand-parsing `serde_json::Value`.
+async fn mithril_request_with_retry<R>(network: Network, request: R) -> Result<R::Response, String>
+where
+    R: xrpl_mithril::models::requests::XrplRequest + Clone + Send + Sync,
+{
+    use xrpl_mithril::client::{Client, JsonRpcClient};
+
+    let candidates = network.rpc_candidates();
+    let mut last_err = String::new();
+
+    for (i, url) in candidates.iter().enumerate() {
+        let client = match JsonRpcClient::new(url) {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = format!("{} : erreur de connexion ({:?})", url, e);
+                continue;
+            }
+        };
+
+        match client.request(request.clone()).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                let msg = e.to_string();
+                let is_last = i == candidates.len() - 1;
+                // Same intent as `is_server_health_issue`, applied to
+                // xrpl-mithril's own error text since it doesn't share our
+                // hand-rolled error strings.
+                let lower = msg.to_lowercase();
+                let is_health_issue = lower.contains("amendmentblocked")
+                    || lower.contains("connect")
+                    || lower.contains("timeout")
+                    || lower.contains("transport")
+                    || lower.contains("timed out");
+                last_err = format!("{} : {}", url, msg);
+                if is_last || !is_health_issue {
+                    return Err(last_err);
+                }
+                // Otherwise: server-health issue, try the next candidate.
+            }
+        }
+    }
+
+    Err(last_err)
+}
+
+/// One trust line (issued-currency balance) held by an account.
+#[derive(Debug, Serialize)]
+pub struct TokenBalance {
+    pub currency: String,
+    pub issuer: String,
+    pub balance: String,
+    /// True if `balance` is negative, i.e. this account is the issuer's
+    /// counterparty *owing* them rather than holding a positive balance --
+    /// surfaced so the caller can display these differently instead of
+    /// showing what looks like a normal token balance.
+    pub is_negative: bool,
+}
+
+/// Fetches every trust line (issued-currency/"token" balance) for an
+/// address, via `account_lines`. Requires ONLY the public address -- exactly
+/// like [`fetch_balance`]/[`fetch_transactions`], no password or seed
+/// involved at any point.
+///
+/// Uses `xrpl-mithril`'s typed request/response models (see
+/// [`mithril_request_with_retry`]) rather than hand-parsed JSON.
+pub async fn fetch_tokens(address: &str, network: Network) -> Result<Vec<TokenBalance>, String> {
+    use xrpl_mithril::models::requests::{AccountLinesRequest, LedgerShortcut, LedgerSpecifier};
+
+    let account = address
+        .parse()
+        .map_err(|_| "Adresse invalide.".to_string())?;
+
+    let request = AccountLinesRequest {
+        account,
+        ledger_index: Some(LedgerSpecifier::Named(LedgerShortcut::Validated)),
+        peer: None,
+        limit: None,
+        marker: None,
+    };
+
+    let response = match mithril_request_with_retry(network, request).await {
+        Ok(r) => r,
+        Err(e) if e.contains("actNotFound") => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+
+    Ok(response
+        .lines
+        .into_iter()
+        // A "0" balance is a trust line that exists but currently holds
+        // nothing (e.g. never funded, or emptied back out) -- not
+        // meaningful to show as a "token owned by this account".
+        .filter(|line| line.balance != "0")
+        .map(|line| TokenBalance {
+            currency: line.currency,
+            issuer: line.account.to_classic_address(),
+            is_negative: line.balance.starts_with('-'),
+            balance: line.balance,
+        })
+        .collect())
+}
+
+/// One NFT (XLS-20 `NFToken`) held by an account.
+#[derive(Debug, Serialize)]
+pub struct NftInfo {
+    /// Hex-encoded `NFTokenID` (32 bytes -> 64 hex chars), the canonical
+    /// identifier for this NFT. Encoded to a plain hex string here so the
+    /// CLI's JSON output stays a simple string, matching every other ID in
+    /// this API (transaction hashes, etc.) rather than a nested byte array.
+    pub nft_id: String,
+    pub issuer: String,
+    pub taxon: u32,
+    /// Only present for NFTs minted with a sequential (non-random) taxon --
+    /// absent otherwise, hence `Option`.
+    pub serial: Option<u32>,
+    /// Raw hex URI, if any (typically points to off-ledger metadata, e.g. a
+    /// hex-encoded `ipfs://...` link). Left undecoded here on purpose --
+    /// decoding/fetching it implies leaving the local machine to resolve an
+    /// arbitrary URI, which is a decision for the caller (CLI/GUI), not this
+    /// network layer.
+    pub uri_hex: Option<String>,
+}
+
+/// Fetches every NFT owned by an address, via `account_nfts`. Requires ONLY
+/// the public address.
+pub async fn fetch_nfts(address: &str, network: Network) -> Result<Vec<NftInfo>, String> {
+    use xrpl_mithril::models::requests::{AccountNftsRequest, LedgerShortcut, LedgerSpecifier};
+
+    let account = address
+        .parse()
+        .map_err(|_| "Adresse invalide.".to_string())?;
+
+    let request = AccountNftsRequest {
+        account,
+        ledger_index: Some(LedgerSpecifier::Named(LedgerShortcut::Validated)),
+        limit: None,
+        marker: None,
+    };
+
+    let response = match mithril_request_with_retry(network, request).await {
+        Ok(r) => r,
+        Err(e) if e.contains("actNotFound") => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+
+    Ok(response
+        .account_nfts
+        .into_iter()
+        .map(|nft| NftInfo {
+            nft_id: hex::encode(nft.nftoken_id.as_bytes()).to_uppercase(),
+            issuer: nft.issuer.to_classic_address(),
+            taxon: nft.nftoken_taxon,
+            serial: nft.nft_serial,
+            uri_hex: nft.uri,
+        })
+        .collect())
+}
+
 /// Builds, signs, and submits an XRP payment via `xrpl-mithril` (high-level
 /// API: autofills Fee/Sequence/LastLedgerSequence, signs the transaction,
 /// submits it, and waits for validation).

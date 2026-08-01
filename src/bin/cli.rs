@@ -7,8 +7,9 @@
 //! - stderr -> human-readable progress/log messages
 //! - non-zero exit code on error
 //!
-//! Security: the `balance` and `transactions` commands only require a public
-//! address (`--address`), never a password. The `send` command only decrypts
+//! Security: the `balance`, `transactions`, and `tokens` commands only
+//! require a public address (`--address`), never a password. The `send`
+//! command only decrypts
 //! the wallet within THIS process, which terminates right afterwards -- the
 //! private key never persists beyond this call.
 //!
@@ -38,6 +39,7 @@ async fn main() {
     match args.get(1).map(String::as_str) {
         Some("balance") => handle_balance(&args).await,
         Some("transactions") | Some("history") => handle_transactions(&args).await,
+        Some("tokens") => handle_tokens(&args).await,
         Some("send") => handle_send(&args).await,
         Some("faucet") => handle_faucet(&args).await,
         _ if args.iter().any(|a| a == "--address") => handle_address(&args),
@@ -342,6 +344,36 @@ async fn handle_transactions(args: &[String]) {
     }
 }
 
+/// Handles the `tokens` command: trust-line (issued-currency) balances and
+/// NFTs for an address. Public address only -- no password, no seed, same
+/// security tier as `balance`/`transactions`.
+async fn handle_tokens(args: &[String]) {
+    let address = match get_flag_value(args, "--address") {
+        Some(a) => a,
+        None => {
+            eprintln!("Erreur : argument --address <adresse> manquant");
+            std::process::exit(1);
+        }
+    };
+    let network = parse_network(args);
+
+    eprintln!("Interrogation du réseau XRPL ({})...", network.label());
+
+    let tokens = network::fetch_tokens(&address, network).await;
+    let nfts = network::fetch_nfts(&address, network).await;
+
+    match (tokens, nfts) {
+        (Ok(tokens), Ok(nfts)) => {
+            let out = serde_json::json!({ "tokens": tokens, "nfts": nfts });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("Erreur : {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Handles the `faucet` command (testnet only).
 async fn handle_faucet(args: &[String]) {
     let address = match get_flag_value(args, "--address") {
@@ -483,6 +515,7 @@ GÉNÉRATION :
 CONSULTATION (adresse publique seulement, aucun mot de passe requis) :
   cli balance --address <ADRESSE> [--network testnet|mainnet]
   cli transactions --address <ADRESSE> [--network testnet|mainnet] [--limit N]
+  cli tokens --address <ADRESSE> [--network testnet|mainnet]           Trust-line balances + NFTs
 
 FAUCET (testnet uniquement -- obtenir des XRP de test gratuits) :
   cli faucet --address <ADRESSE> [--network testnet]

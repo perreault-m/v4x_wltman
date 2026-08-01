@@ -101,5 +101,14 @@
 
   "tabs.wallet" : "Portefeuille",
   "tabs.trade" : "Trade",
-  "tabs.coming_soon" : "A venir"
+  "tabs.coming_soon" : "A venir",
+
+  "panel.tokens": "Tokens & NFTs",
+  "tokens.none_selected": "Sélectionnez un wallet pour voir ses tokens.",
+  "tokens.loading": "Chargement des tokens...",
+  "tokens.title": "Tokens",
+  "tokens.none": "Aucun token.",
+  "nfts.title": "NFTs",
+  "nfts.none": "Aucun NFT.",
+  "nfts.taxon_label": "Taxon"
 }

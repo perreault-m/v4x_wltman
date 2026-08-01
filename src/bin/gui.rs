@@ -259,6 +259,10 @@ type LoadOutcome = Result<(String, String), String>;
 type InfoOutcome = Result<(BalanceInfo, Vec<TxInfo>), String>;
 type SendOutcome = Result<String, String>;
 type FaucetOutcome = Result<(), String>;
+/// (trust-line balances, NFTs) -- fetched by the `tokens` CLI command,
+/// alongside (but independently of) balance/transactions: see
+/// `trigger_refresh`.
+type TokensOutcome = Result<(Vec<TokenInfo>, Vec<NftInfo>), String>;
 
 /// A wallet "unlocked" for the session: only its address (never its
 /// private key). The password will need to be re-entered to send a
@@ -287,6 +291,38 @@ struct TxInfo {
     amount_xrp: Option<String>,
     destination_tag: Option<u64>,
     successful: bool,
+}
+
+/// One trust line (issued-currency balance), as returned by the CLI's
+/// `tokens` command -- mirrors `network::TokenBalance`.
+#[derive(Debug, Clone, Deserialize)]
+struct TokenInfo {
+    currency: String,
+    issuer: String,
+    balance: String,
+    is_negative: bool,
+}
+
+/// One NFT, as returned by the CLI's `tokens` command -- mirrors
+/// `network::NftInfo`. `uri_hex` is kept raw (undecoded) here too, same
+/// reasoning as in `network.rs`.
+#[derive(Debug, Clone, Deserialize)]
+struct NftInfo {
+    nft_id: String,
+    issuer: String,
+    taxon: u32,
+    serial: Option<u32>,
+    #[allow(dead_code)] // not yet rendered -- kept for a future "view metadata" action
+    uri_hex: Option<String>,
+}
+
+/// Shape of the CLI's `tokens` command JSON output (`{"tokens": [...],
+/// "nfts": [...]}`), deserialized in one shot then split into the two
+/// vectors the rest of the app deals with.
+#[derive(Debug, Deserialize)]
+struct TokensResponse {
+    tokens: Vec<TokenInfo>,
+    nfts: Vec<NftInfo>,
 }
 
 #[derive(Default)]
@@ -327,6 +363,16 @@ struct MyApp {
     current_balance: Option<BalanceInfo>,
     current_txs: Vec<TxInfo>,
     info_result: Arc<Mutex<Option<InfoOutcome>>>,
+
+    // --- active wallet's tokens (trust lines) + NFTs -- fetched alongside
+    // balance/transactions by the same `trigger_refresh` call, but tracked
+    // independently so a failure here never blanks out the balance panel
+    // (or vice versa).
+    tokens_loading: bool,
+    tokens_error: Option<String>,
+    current_tokens: Vec<TokenInfo>,
+    current_nfts: Vec<NftInfo>,
+    tokens_result: Arc<Mutex<Option<TokensOutcome>>>,
 
     // --- faucet (testnet only) ---
     faucet_requesting: bool,
@@ -421,6 +467,7 @@ enum Message {
     SelectWallet(String),
     RefreshInfo,
     TickInfo,
+    TickTokens,
 
     RequestFaucet,
     TickFaucet,
@@ -475,11 +522,16 @@ impl MyApp {
         )
     }
 
-    /// (Re)starts fetching the balance + latest transactions for the
-    /// currently selected wallet, on the currently selected network. Only
-    /// requires the address -- no password.
+    /// (Re)starts fetching the balance, latest transactions, and
+    /// tokens/NFTs for the currently selected wallet, on the currently
+    /// selected network. Only requires the address -- no password. All
+    /// three are fetched from the same background thread (one "refresh"
+    /// action), but tracked as two independent outcomes (`info_result` for
+    /// balance/tx, `tokens_result` for tokens/NFTs) so a failure fetching
+    /// one never blanks out a successful fetch of the other.
     fn trigger_refresh(&mut self) -> Task<Message> {
         self.info_error = None;
+        self.tokens_error = None;
 
         let address = match self
             .selected_unlocked
@@ -495,7 +547,13 @@ impl MyApp {
         self.current_txs.clear();
         *self.info_result.lock().unwrap() = None;
 
+        self.tokens_loading = true;
+        self.current_tokens.clear();
+        self.current_nfts.clear();
+        *self.tokens_result.lock().unwrap() = None;
+
         let result_slot = Arc::clone(&self.info_result);
+        let tokens_result_slot = Arc::clone(&self.tokens_result);
         let network = self.network.as_str().to_string();
 
         std::thread::spawn(move || {
@@ -516,9 +574,9 @@ impl MyApp {
                     let tx_res = run_cli(vec![
                         "transactions".into(),
                         "--address".into(),
-                        address,
+                        address.clone(),
                         "--network".into(),
-                        network,
+                        network.clone(),
                         "--limit".into(),
                         "10".into(),
                     ])
@@ -532,9 +590,26 @@ impl MyApp {
             };
 
             *result_slot.lock().unwrap() = Some(outcome);
+
+            // Tokens/NFTs -- same address/network, same background thread,
+            // deliberately independent outcome (see doc comment above).
+            let tokens_outcome: TokensOutcome = run_cli(vec![
+                "tokens".into(),
+                "--address".into(),
+                address,
+                "--network".into(),
+                network,
+            ])
+            .and_then(|s| {
+                serde_json::from_str::<TokensResponse>(&s)
+                    .map(|r| (r.tokens, r.nfts))
+                    .map_err(|_| "Réponse tokens invalide.".to_string())
+            });
+
+            *tokens_result_slot.lock().unwrap() = Some(tokens_outcome);
         });
 
-        Self::schedule(Message::TickInfo)
+        Task::batch([Self::schedule(Message::TickInfo), Self::schedule(Message::TickTokens)])
     }
 
     /// Starts fetching the currently selected wallet's seed from the `cli`
@@ -896,6 +971,24 @@ impl MyApp {
                     } else {
                         drop(slot);
                         return Self::schedule(Message::TickInfo);
+                    }
+                }
+            }
+            Message::TickTokens => {
+                if self.tokens_loading {
+                    let mut slot = self.tokens_result.lock().unwrap();
+                    if let Some(outcome) = slot.take() {
+                        self.tokens_loading = false;
+                        match outcome {
+                            Ok((tokens, nfts)) => {
+                                self.current_tokens = tokens;
+                                self.current_nfts = nfts;
+                            }
+                            Err(e) => self.tokens_error = Some(e),
+                        }
+                    } else {
+                        drop(slot);
+                        return Self::schedule(Message::TickTokens);
                     }
                 }
             }
@@ -1331,9 +1424,15 @@ impl MyApp {
         let wallet_panel = card(t(self.lang, "panel.wallet"), self.wallet_top_panel(), Length::Fill);
 
         let actions_card = card(t(self.lang, "panel.actions"), self.actions_panel(), Length::Fixed(280.0));
+        let tokens_card = card(t(self.lang, "panel.tokens"), self.tokens_panel(), Length::Fixed(280.0));
+        // Actions + tokens/NFTs stacked in the same fixed-width left
+        // column, directly under one another; balance/tx panel fills the
+        // remaining width to the right, same as before.
+        let left_column = column![actions_card, tokens_card].spacing(20);
+
         let info_card = card(t(self.lang, "panel.balance"), self.info_panel(), Length::Fill);
 
-        let lower = row![actions_card, info_card]
+        let lower = row![left_column, info_card]
             .spacing(20)
             .align_y(Alignment::Start)
             .width(Length::Fill);
@@ -1586,6 +1685,52 @@ impl MyApp {
             } else {
                 for tx in &self.current_txs {
                     items.push(tx_row(tx, self.lang));
+                }
+            }
+        }
+
+        Column::with_children(items).spacing(12).into()
+    }
+
+    /// Trust-line (token) balances and NFTs for the active wallet -- same
+    /// panel structure as `info_panel`, populated by the same
+    /// `trigger_refresh` call (see its doc comment) but tracked via its own
+    /// loading/error state so this panel's failure never blanks out the
+    /// balance/transactions panel next to it, or vice versa.
+    fn tokens_panel(&self) -> Element<Message> {
+        let selected = self
+            .selected_unlocked
+            .as_ref()
+            .and_then(|name| self.unlocked_wallets.iter().find(|w| &w.name == name));
+
+        let Some(_w) = selected else {
+            return text(t(self.lang, "tokens.none_selected")).size(13).color(MUTED).into();
+        };
+
+        let mut items: Vec<Element<Message>> = Vec::new();
+
+        if self.tokens_loading {
+            items.push(text(t(self.lang, "tokens.loading")).size(13).color(MUTED).into());
+        } else if let Some(err) = &self.tokens_error {
+            items.push(text(err).size(13).color(ERROR).into());
+        } else {
+            items.push(text(t(self.lang, "tokens.title")).size(13).color(ACCENT).into());
+
+            if self.current_tokens.is_empty() {
+                items.push(text(t(self.lang, "tokens.none")).size(13).color(MUTED).into());
+            } else {
+                for token in &self.current_tokens {
+                    items.push(token_row(token));
+                }
+            }
+
+            items.push(text(t(self.lang, "nfts.title")).size(13).color(ACCENT).into());
+
+            if self.current_nfts.is_empty() {
+                items.push(text(t(self.lang, "nfts.none")).size(13).color(MUTED).into());
+            } else {
+                for nft in &self.current_nfts {
+                    items.push(nft_row(nft, self.lang));
                 }
             }
         }
@@ -2148,6 +2293,47 @@ fn tx_row(tx: &TxInfo, lang: Lang) -> Element<'static, Message> {
         ))
         .size(13),
         text(format!("{}    {}", date, hash_short)).size(11).color(MUTED),
+    ]
+    .spacing(2)
+    .into()
+}
+
+/// Renders one trust-line balance: amount + currency on top (in the accent
+/// color, or the warning color if `is_negative` -- see [`TokenInfo`]),
+/// issuer address below in the same small/muted style used for tx hashes.
+fn token_row(token: &TokenInfo) -> Element<'static, Message> {
+    let amount_color = if token.is_negative { WARNING } else { ACCENT };
+
+    column![
+        text(format!("{} {}", token.balance, token.currency))
+            .size(13)
+            .color(amount_color),
+        text(token.issuer.clone()).size(11).color(MUTED),
+    ]
+    .spacing(2)
+    .into()
+}
+
+/// Renders one NFT: shortened NFTokenID on top, taxon (and serial, if any)
+/// below -- same visual pattern as [`tx_row`]/[`token_row`].
+fn nft_row(nft: &NftInfo, lang: Lang) -> Element<'static, Message> {
+    let id_short = if nft.nft_id.len() > 14 {
+        format!("{}…{}", &nft.nft_id[..8], &nft.nft_id[nft.nft_id.len() - 4..])
+    } else {
+        nft.nft_id.clone()
+    };
+
+    let taxon_label = t(lang, "nfts.taxon_label");
+    let serial_suffix = nft
+        .serial
+        .map(|s| format!("    #{}", s))
+        .unwrap_or_default();
+
+    column![
+        text(id_short).size(13).color(ACCENT),
+        text(format!("{}: {}{}", taxon_label, nft.taxon, serial_suffix))
+            .size(11)
+            .color(MUTED),
     ]
     .spacing(2)
     .into()
